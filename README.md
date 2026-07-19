@@ -1,4 +1,4 @@
-# @busbar/busbar (TypeScript SDK)
+# @busbar/busbar-admin (TypeScript SDK)
 
 A typed TypeScript client for the **Busbar Admin API** (`/api/v1/admin`).
 
@@ -16,7 +16,7 @@ targets the frozen, additive-only `/api/v1/admin` surface.
 ## Install
 
 ```bash
-npm install @busbar/busbar
+npm install @busbar/busbar-admin
 ```
 
 ## Usage
@@ -27,8 +27,8 @@ your endpoint and token, then call `GET /info` (see
 
 ```ts
 import { createClient, createConfig } from "@hey-api/client-fetch";
-import { getApiV1AdminInfo } from "@busbar/busbar";
-import type { InfoView } from "@busbar/busbar";
+import { getApiV1AdminInfo } from "@busbar/busbar-admin";
+import type { InfoView } from "@busbar/busbar-admin";
 
 const client = createClient(
   createConfig({

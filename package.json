@@ -1,5 +1,5 @@
 {
-  "name": "@busbar/busbar",
+  "name": "@busbar/busbar-admin",
   "version": "0.1.0",
   "description": "TypeScript SDK for the Busbar admin API (generated from the typed OpenAPI 3.1 schema).",
   "license": "Apache-2.0",
