@@ -1,0 +1,25 @@
+{
+  "name": "@getbusbar/busbar",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the Busbar admin API (generated from the typed OpenAPI 3.1 schema).",
+  "license": "Apache-2.0",
+  "author": "Busbar, Inc.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "files": ["src", "openapi.json", "README.md", "LICENSE"],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "generate": "openapi-ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@hey-api/client-fetch": "0.8.4"
+  },
+  "devDependencies": {
+    "@hey-api/openapi-ts": "0.64.15",
+    "typescript": "5.7.3"
+  }
+}

@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install deps (pinned)
+        run: npm ci
+
+      - name: Regenerate client from openapi.json
+        run: npm run generate
+
+      - name: Fail if the committed client is stale
+        run: git diff --exit-code -- src
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Publish is gated on the npm token. Without it, the build/typecheck above
+      # still runs and the job succeeds without publishing.
+      - name: Publish to npm
+        if: ${{ env.NPM_TOKEN != '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+      - name: Note when token is absent
+        if: ${{ env.NPM_TOKEN == '' }}
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: echo "::notice::NPM_TOKEN not set — built & typechecked but skipped publish."

@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install deps (pinned)
+        run: npm ci
+
+      - name: Regenerate client from openapi.json
+        run: npm run generate
+
+      - name: Fail if the committed client is stale
+        run: |
+          git diff --exit-code -- src \
+            || (echo "::error::Generated client is out of date. Run 'npm run generate' and commit." && exit 1)
+
+      - name: Typecheck (proves the client + typed example compile)
+        run: npm run typecheck
