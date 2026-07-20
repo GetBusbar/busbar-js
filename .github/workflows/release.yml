@@ -5,9 +5,20 @@ on:
     tags:
       - "v*"
 
+# Publishing uses npm OIDC "trusted publishing": GitHub Actions mints a short-lived
+# identity token that npm verifies against a trusted publisher you configure once —
+# no automation token, no NODE_AUTH_TOKEN, nothing that expires. It also attaches a
+# signed provenance attestation to the package automatically.
+#
+# One-time setup: on npmjs.com → the @busbar/busbar-admin package → Settings →
+# "Trusted Publisher" → GitHub Actions (owner: GetBusbar, repo: busbar-js,
+# workflow: release.yml).
 jobs:
   publish:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required for OIDC trusted publishing + provenance
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -15,6 +26,9 @@ jobs:
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
+
+      - name: Use an npm that supports OIDC trusted publishing
+        run: npm install -g npm@latest
 
       - name: Install deps (pinned)
         run: npm ci
@@ -28,17 +42,5 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
-      # Publish is gated on the npm token. Without it, the build/typecheck above
-      # still runs and the job succeeds without publishing.
-      - name: Publish to npm
-        if: ${{ env.NPM_TOKEN != '' }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to npm (OIDC trusted publishing — no token)
         run: npm publish --access public
-
-      - name: Note when token is absent
-        if: ${{ env.NPM_TOKEN == '' }}
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: echo "::notice::NPM_TOKEN not set — built & typechecked but skipped publish."
