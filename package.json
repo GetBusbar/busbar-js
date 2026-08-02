@@ -3,6 +3,10 @@
   "version": "0.2.0",
   "description": "TypeScript SDK for the Busbar admin API (generated from the typed OpenAPI 3.1 schema).",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GetBusbar/busbar-js.git"
+  },
   "author": "Busbar, Inc.",
   "type": "module",
   "main": "./src/index.ts",
