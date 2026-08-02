@@ -32,7 +32,7 @@ export type AdminAuthView = {
 
 /**
  * One admin audit record. `outcome` is a stable token tooling can branch on. The record is
- * HASH-CHAINED for tamper-EVIDENCE (§6.7): `hash = sha256(prev_hash | seq | ts | action | resource |
+ * HASH-CHAINED for tamper-EVIDENCE: `hash = sha256(prev_hash | seq | ts | action | resource |
  * outcome | principal)`, and `prev_hash` is the preceding entry's `hash`. Recomputing the chain detects any
  * altered/reordered/deleted entry (detection, not prevention — a compromised host can still rewrite
  * the whole chain; prevention is shipping the log off-box to a SIEM).
@@ -187,6 +187,56 @@ export type ConfigRollbackView = {
 };
 
 /**
+ * `GET`/`PUT /config/settings` (1.5.0 full-config coverage) — the API-settable single-value config
+ * overlay (`root` section) and, on a PUT, the apply metadata. `settings` is the CURRENT effective
+ * root override (the merge of prior overlay + this request). It is overlay-persisted so it survives
+ * a restart WHEN a config overlay is configured (`BUSBAR_CONFIG_OVERLAY`) — a busbar with none
+ * applies the change live only, and `note` says so; `PUT` with `"persist": true` makes storage
+ * mandatory, refusing (`400`) rather than silently applying in memory when no overlay exists.
+ * `reload_to_apply` names the fields whose new value is DURABLY STORED but not yet LIVE: the
+ * process-level binds (`listen`/`admin_listen` socket, `tls`/`admin_tls` bind, `admin_insecure`) are
+ * read once at process start, and the durable `store` backend is reused across a hot reload — none
+ * can hot-swap, so they take effect on the next RESTART (or a supervisor restart), NEVER on a
+ * `POST /config/reload` — a reload re-reads disk and rebuilds the `App` but does not rebind sockets,
+ * rebuild the TLS acceptor, or re-open the store. It is always EMPTY when nothing was durably stored
+ * (no overlay); `note` names the affected fields instead. Everything else
+ * (`rate_card`/`per_request_fee`/`security`/`advanced`/`metrics`/`health`/`routing`) is LIVE on the
+ * swap; `limits` is live EXCEPT four boot-scoped fields (see `reload_to_apply_fields`):
+ * `upstream_request_timeout_secs`/`pool_max_idle_per_host`/`pool_idle_timeout_secs`, which the
+ * reused `UpstreamClients` only reads once at boot, and `max_inbound_concurrent`, which is baked
+ * once into the data router's `GlobalConcurrencyLimitLayer` at process start (a config apply swaps
+ * only `Arc<App>`, never the router) — two independent freezing mechanisms. `observability` is live
+ * EXCEPT three boot-scoped fields: `emit_server_timing` (baked into router middleware state at
+ * boot), `request_log_webhook_url` (seeds a process-global `OnceLock` that no-ops after the first
+ * `main()` call), and `otlp_url` (feeds a one-shot `tracing_subscriber` init) — none rebuilt by an
+ * apply.
+ */
+export type ConfigSettingsView = {
+    /**
+     * `true` on a PUT that stored + swapped; `false` on a GET (a pure read).
+     */
+    applied: boolean;
+    config_version: number;
+    /**
+     * A human note describing the live-vs-reload split (absent on a GET).
+     */
+    note?: string | null;
+    /**
+     * Fields that were stored durably but are RESTART-TO-APPLY: a socket rebind, a TLS acceptor
+     * build and a store open all happen once at process start, so a `POST /config/reload` does NOT
+     * make them live — `POST /restart` (or a supervisor restart) does. Empty when the PUT touched
+     * only live-swappable fields (or on a GET). The field NAME is frozen wire; only this description
+     * changed.
+     */
+    reload_to_apply?: Array<string>;
+    /**
+     * The current effective root-section overlay (only the fields the operator has set; base
+     * `config.yaml` stands for the rest). An arbitrary JSON object (the `RootSettings` projection).
+     */
+    settings: unknown;
+};
+
+/**
  * The result of `POST /api/v1/admin/config/validate` — a DRY-RUN: does a proposed config resolve +
  * validate, WITHOUT applying anything. `ok` is the verdict; `errors` lists every structural/resolution
  * failure at once (empty when `ok`). A well-formed request always returns 200 with this view (a valid
@@ -247,12 +297,65 @@ export type ConfigVersionPageView = {
 };
 
 /**
- * `POST /keys` (mint) — the key metadata plus the ONCE-shown secret, and (when an AWS SigV4
+ * `POST /keys` body (1.5.0 signed-token keys, S1): PURE AUTH + a signed expiring token. A minted
+ * key is a busbar-signed `{sub, exp, kid}` token, returned ONCE. No rpm/tpm/budget on a key - all
+ * enforcement flows through the bound `group`. `#[serde(deny_unknown_fields)]` so the removed
+ * 1.4.x fields (max_budget_cents/rpm_limit/tpm_limit/budget_period) fail loudly.
+ */
+export type CreateKeyReq = {
+    /**
+     * Pools this key may target. OMITTED = ALL pools; an explicit `[]` = NO pools (C6).
+     */
+    allowed_pools?: Array<string> | null;
+    /**
+     * Token expiry as an absolute Unix-seconds timestamp. Mutually exclusive with `expires_in`.
+     */
+    expires_at?: number | null;
+    /**
+     * Token lifetime as a duration string (`7d`, `24h`, `30m`, `3600s`) - the token's `exp` is
+     * `now + expires_in`. Mutually exclusive with `expires_at`. Absent (and no `expires_at`) => a
+     * sane long default (see `DEFAULT_KEY_TTL_SECS`).
+     */
+    expires_in?: string | null;
+    /**
+     * The `groups:` bucket this key binds to (at most one). A key with NO group is authed +
+     * unlimited (access only). If the named group EXISTS, the key binds to it. If it does NOT
+     * exist, the mint 400s UNLESS `parent` is given — then it is AUTO-PROVISIONED as a leaf under
+     * `parent` (self-service D2; see `parent`).
+     */
+    group?: string | null;
+    /**
+     * When true, ALSO issue an AWS-style access-key-id + secret access key (the MinIO/S3-compatible
+     * model) so a Bedrock-SDK client can authenticate via inbound SigV4. Both are returned ONCE.
+     */
+    issue_aws_credential?: boolean;
+    /**
+     * Optional mint-time labels echoed onto this key's metric series; never interpreted by
+     * enforcement.
+     */
+    labels?: {
+        [key: string]: string;
+    };
+    name: string;
+    /**
+     * AUTO-PROVISION target: the EXISTING parent group under which to create
+     * `group` as a leaf when `group` does not yet exist — the first-self-mint materialization of a
+     * `user:<sub>` personal budget bucket. The new leaf's limits come from the nearest-ancestor
+     * `child_default` template (inherit-only when none up the chain), created through the same
+     * validate-at-the-door path as `POST /groups`. If `group` ALREADY exists, `parent` must equal
+     * its actual parent (else 409) — a mint never re-homes an existing group. Ignored when `group`
+     * is absent (a key with no group has nothing to provision).
+     */
+    parent?: string | null;
+};
+
+/**
+ * `POST /keys` (mint) — the key metadata plus the ONCE-shown signed token, and (when an AWS SigV4
  * credential was requested) the AccessKeyId + secret access key. The AWS fields are absent on a
  * bearer-only mint.
  */
 export type CreatedKeyView = {
-    allowed_pools: Array<string>;
+    allowed_pools: Array<string> | null;
     /**
      * AWS AccessKeyId (present only when `issue_aws_credential` was set). Not secret.
      */
@@ -261,18 +364,33 @@ export type CreatedKeyView = {
      * AWS SigV4 secret access key — shown once (present only with an AWS credential).
      */
     aws_secret_access_key?: string | null;
-    budget_period: string;
     created_at: number;
     enabled: boolean;
-    id: string;
-    max_budget_cents: number | null;
-    name: string;
-    rpm_limit: number | null;
     /**
-     * The bearer secret — shown EXACTLY once, never returned by any read.
+     * Unix-seconds expiry of the signed token.
      */
-    secret: string;
-    tpm_limit: number | null;
+    expires_at: number;
+    group: string | null;
+    /**
+     * Whether this mint AUTO-PROVISIONED its bound group leaf (self-service D2) — lets a portal
+     * distinguish "bound to an existing bucket" from "created your personal bucket + bound".
+     */
+    group_provisioned: boolean;
+    id: string;
+    labels: {
+        [key: string]: string;
+    };
+    name: string;
+    /**
+     * E-007: same field as `KeyView.state` — a fresh mint is always `"active"` (enabled, not
+     * revoked, not deleted).
+     */
+    state: string;
+    /**
+     * The busbar-SIGNED token — the key credential (1.5.0, S1), shown EXACTLY once and never
+     * returned by any read. (This is the field a client must capture to authenticate.)
+     */
+    token: string;
 };
 
 /**
@@ -308,6 +426,110 @@ export type _Error = {
 };
 
 /**
+ * The `POST /api/v1/admin/auth/cache/flush` body. An absent body (or an absent `module`) flushes
+ * every partition. Deliberately NOT `deny_unknown_fields`: the endpoint has always ignored extra
+ * members, and tightening that would reject a call that works today.
+ */
+export type FlushCacheReq = {
+    /**
+     * The auth module whose cache partition to flush. Omitted = flush all.
+     */
+    module?: string | null;
+};
+
+/**
+ * One `(window, pool?)` enforcement bucket's usage vs caps inside a [`GroupUsageView`].
+ */
+export type GroupBucketUsageView = {
+    budget_cap?: number | null;
+    /**
+     * Cents left under `budget_cap` (floored at 0); absent when no budget cap is set.
+     */
+    budget_remaining_cents?: number | null;
+    /**
+     * The pool scope for a pool-qualified bucket; absent for a group-wide bucket.
+     */
+    pool?: string | null;
+    /**
+     * Requests admitted this window (the requests-limit truth: failures are not refunded).
+     */
+    requests: number;
+    /**
+     * The bucket's caps, when configured (absent = uncapped on that metric).
+     */
+    requests_cap?: number | null;
+    /**
+     * Spend derived at read time (tokens x current rate card), abstract cents.
+     */
+    spend_cents: number;
+    /**
+     * Total tokens ledgered this window (all tiers).
+     */
+    tokens: number;
+    tokens_cap?: number | null;
+    /**
+     * The accounting window: `minute` | `hour` | `day` | `month` | `total`.
+     */
+    window: string;
+};
+
+/**
+ * `GET /groups/{name}/usage` — one group's DERIVED current-window usage, one row per
+ * enforcement bucket (each `(window, pool?)` its limits materialise), against that bucket's
+ * caps. The dashboard read: spend/tokens/requests per tier vs the budgets, straight off the
+ * ledger x the CURRENT rate card (reprice-on-read, nothing stored). The customer's self-service
+ * tool consumes this per group (`user:<sub>` leaf = one person's view) and re-scopes it.
+ */
+export type GroupUsageView = {
+    /**
+     * Epoch seconds the read was taken at (the windows below are current AS OF this instant).
+     */
+    as_of: number;
+    /**
+     * One row per enforcement bucket, in the group's resolved bucket order. Empty for a group
+     * with only a `concurrent` limit (or none) — there is no windowed ledger to read.
+     */
+    buckets: Array<GroupBucketUsageView>;
+    /**
+     * `false` = the group is FROZEN (`enabled: false`): every request through it rejects.
+     */
+    enabled: boolean;
+    /**
+     * The group name (echoed from the path).
+     */
+    group: string;
+};
+
+/**
+ * A group definition in the registry read (`GET /api/v1/admin/groups`,
+ * `GET /api/v1/admin/groups/{name}`) — the limit-tree read surface. Projects the `groups:` config
+ * entry faithfully (parent chain, enabled freeze flag, the ordered limits, the `child_default`
+ * budget template for auto-provisioned children), never a secret. This is the READ shape; the
+ * WRITE verbs accept a `GroupCfg` verbatim (paste a config.yaml group block). Additive-only.
+ */
+export type GroupView = {
+    /**
+     * The limit template stamped onto children auto-provisioned under this group (e.g. a
+     * `user:<sub>` leaf on first self-mint). Skipped from the body when the group sets none.
+     */
+    child_default?: Array<LimitView> | null;
+    /**
+     * `false` FREEZES the group (every request charging through it is rejected; history kept).
+     */
+    enabled: boolean;
+    /**
+     * The group's own limits, enforced together (AND). Order preserved from config.
+     */
+    limits: Array<LimitView>;
+    name: string;
+    /**
+     * The parent group whose limits this one is ANDed under (the enforcement chain). `None` = a
+     * root group. Skipped from the body when absent.
+     */
+    parent?: string | null;
+};
+
+/**
  * The DESIRED settings side of `hooks/{name}/status`: busbar's registry copy of the hook's settings
  * and their version.
  */
@@ -319,20 +541,24 @@ export type HookDesiredStatus = {
 };
 
 /**
- * The live health of one hook's transport (`GET /api/v1/admin/hooks/{name}/health`). BEST-EFFORT: for a
- * socket transport `reachable` is `Some(true/false)` from a short-timeout connect probe; for a webhook
- * (or on a non-unix host) it is `None` (probed on demand, not here) with a `detail` note. Never fires
- * the hook — just checks whether the endpoint accepts a connection. Additive-only.
+ * The live health of one hook's transport (`GET /api/v1/admin/hooks/{name}/health`). Checks
+ * whether the hook resolves to a LOADED `kind: hook` plugin in the process's plugin registry —
+ * this is a plugin-LOAD status check, not a network reachability probe: it never opens a
+ * connection, and it cannot tell you whether a `kind: hook` plugin's own configured external
+ * endpoint (e.g. `busbar-webrequest-hook`'s `settings.url`) is actually reachable, only that the
+ * plugin itself is loaded. Never fires the hook. Additive-only.
  */
 export type HookHealthView = {
     /**
-     * A short human note on the probe (why `None`, or the connect error class). Never a secret.
+     * A short human note on the resolution (why `false`, or the resolved plugin's kind). Never a
+     * secret.
      */
     detail: string | null;
     name: string;
     /**
-     * `Some(true)` = the transport accepted a connection; `Some(false)` = it did not; `None` = not
-     * probed here (webhook / non-unix).
+     * `Some(true)` = resolves to a loaded `kind: hook` plugin; `Some(false)` = it does not
+     * (wrong kind, or not installed/loaded) — always `Some`, never `None`, as of 1.5.0's
+     * in-process plugin model.
      */
     reachable: boolean | null;
     transport: HookTransportView;
@@ -374,6 +600,18 @@ export type HookStatusView = {
      * Validated + bounded self-reported metrics; each entry carries `{name, type, value}` and, when
      * the hook sent them, optional `labels`/`quantiles`/`estimated`/`ci_low`/`ci_high`/`help`/
      * `label`/`unit`/`viz`/`max` members.
+     *
+     * E-004 (busbar-ui/docs/ENGINE-BUGS.md): schemars' blanket `JsonSchema` impl for
+     * `serde_json::Value` renders as the JSON-Schema-2020-12 boolean `true` (`schemars-1.2.1`'s
+     * `json_schema_impls/serdejson.rs`), which is legal 2020-12 but — nested here as this array's
+     * `items` — is a boolean SUB-schema, and `kin-openapi` (the parser under `oapi-codegen`, which
+     * every published SDK generates through) cannot represent one at all: the parse aborts, taking
+     * out Python/TS/Go SDK regeneration simultaneously. `#[schemars(schema_with)]` overrides just
+     * this field's schema to `{"type": "array", "items": {}}` — `{}` is the equivalent "accepts
+     * anything" schema every generator DOES understand, and is what busbar-ui's own
+     * `openapi-prep.py` already rewrites `items: true` into client-side. This is the only
+     * `items: true` in the document; every other `additionalProperties: true` schemars emits
+     * elsewhere is a boolean in a position `kin-openapi` handles fine and is deliberately untouched.
      */
     metrics: Array<unknown>;
     name: string;
@@ -389,16 +627,18 @@ export type HookStatusView = {
 };
 
 /**
- * The transport half of a `HookView`: which wire the hook speaks and its target (socket path or
- * webhook URL — operator config, not a secret). Exactly one of `socket`/`webhook` is set.
+ * The transport half of a `HookView`. As of 1.5.0 a hook is EITHER a compiled-in kind (no
+ * transport at all) or a signed `kind: hook` dlopen'd plugin (`target` = the plugin NAME, not a
+ * socket path or URL) — the retired 1.4.x socket/webhook sidecar transports are gone.
  */
 export type HookTransportView = {
     /**
-     * `"socket"` or `"webhook"` (or `"none"` for a misconfigured entry with neither).
+     * `"plugin"` for a signed dlopen'd hook plugin, or `"none"` for a hook with no plugin
+     * transport (compiled-in kinds, or a misconfigured entry).
      */
     kind: string;
     /**
-     * The socket path or webhook URL. `None` only if the definition set neither transport.
+     * The plugin's NAME (not a path or URL). `None` when `kind` is `"none"`.
      */
     target: string | null;
 };
@@ -494,19 +734,41 @@ export type InfoView = {
 };
 
 /**
- * `GET /keys/{id}/usage` — the current budget-window counters for one key, plus the fraction of the
- * tightest RPM/TPM cap remaining (`null` = uncapped). `budget_period`/`window_start` are `null`
- * when the key record could not be read.
+ * The `POST /api/v1/admin/plugins` request body: install a SIGNED plugin tarball. The tarball
+ * bytes ride as base64 (`tarball_b64`) — a plugin artifact is opaque binary, so base64 keeps it a
+ * clean JSON field. The engine RE-VERIFIES the contained signed manifest server-side against the
+ * running `plugins.*` trust posture (the client is never trusted). `file` is the bare `.tar.gz`
+ * filename to store it under (storage only — identity comes from the signed manifest inside).
+ */
+export type InstallPluginReq = {
+    file: string;
+    tarball_b64: string;
+};
+
+/**
+ * `GET /keys/{id}/usage`: the key's all-time attribution counters (a 1.5.0 key bucket accrues in
+ * the `total` window; limits live on the bound group's own windows) plus the fraction of the
+ * tightest `requests`/`tokens` limit across the group chain remaining (`null` = no such limit).
  */
 export type KeyMeteringView = {
     as_of: number;
-    budget_period: string | null;
+    /**
+     * Always `"total"` (the key attribution window).
+     */
+    budget_period: string;
+    /**
+     * The bound `groups:` entry (`null` = unlimited key).
+     */
+    group: string | null;
     id: string;
     rate_headroom: number | null;
     requests: number;
     spend_cents: number;
     tokens: number;
-    window_start: number | null;
+    /**
+     * Always `0` (the all-time window start).
+     */
+    window_start: number;
 };
 
 /**
@@ -530,9 +792,12 @@ export type KeyUsageView = {
     name: string | null;
     requests: number;
     /**
-     * Busbar's derived cost estimate in MICRO-units of `currency` (1e-6 USD — integer math,
-     * sub-cent precise, no float drift), from the operator's configured global prices. A consumer
-     * with its own per-model catalog recomputes from the raw token split instead.
+     * Busbar's derived cost estimate in MICRO-units of the ABSTRACT cost unit (1e-6 unit -
+     * integer math, sub-cent precise, no float drift), recomputed at read time from the raw token
+     * split x the operator's CURRENT per-model rate card. Busbar attaches no currency - the rate
+     * card's numbers are whatever unit the operator priced in; display/denomination is entirely
+     * the consumer's concern. A consumer with its own per-model catalog recomputes from the raw
+     * token split instead.
      */
     spend_micros: number;
     tokens_cache_creation: number;
@@ -546,18 +811,69 @@ export type KeyUsageView = {
 
 /**
  * Virtual-key metadata — the `key_meta()` shape returned by `GET /keys/{id}`, `PATCH /keys/{id}`,
- * and as each item of `GET /keys`. Never the secret or its hash.
+ * and as each item of `GET /keys`. Never the secret or its hash. 1.5.0: keys are PURE AUTH, no
+ * inline limits; `allowed_pools` is `null` = all pools, `[]` = no pools (C6); `group` names the
+ * bound `groups:` entry (`null` = unlimited).
  */
 export type KeyView = {
-    allowed_pools: Array<string>;
-    budget_period: string;
+    allowed_pools: Array<string> | null;
     created_at: number;
     enabled: boolean;
+    group: string | null;
     id: string;
-    max_budget_cents: number | null;
+    labels: {
+        [key: string]: string;
+    };
     name: string;
-    rpm_limit: number | null;
-    tpm_limit: number | null;
+    /**
+     * E-007: `enabled` alone cannot distinguish a reversible pause from either of the two permanent
+     * dispositions — `PATCH {enabled:false}`, `POST /keys/{id}/revoke`, and `DELETE /keys/{id}` all
+     * used to leave `enabled: false` with nothing else to tell them apart. One of exactly four
+     * values, additive and derived (never independently settable):
+     * - `"active"` — enabled, not revoked, not deleted.
+     * - `"disabled"` — `PATCH {enabled:false}`. Reversible: `PATCH {enabled:true}` restores it.
+     * - `"revoked"` — `POST /keys/{id}/revoke`. Permanent: denylisted, but the binding row (and
+     * `GET /keys/{id}`) stays live for audit/usage attribution.
+     * - `"tombstoned"` — `DELETE /keys/{id}`. Permanent: denylisted AND hard-deleted; the row is
+     * kept only so id-attributed billing/audit history keeps resolving. Omitted from a plain
+     * `GET /keys` by default; visible there with `?include=tombstoned`.
+     */
+    state: string;
+};
+
+/**
+ * One limit inside a `GroupView`: an explicit `{ metric, amount, per, pool }` projection of a
+ * config `LimitCfg`. The config file's compact `{ budget: 3000, per: month }` form is
+ * deserialize-only sugar; the read API projects it explicitly so a consumer never has to know
+ * the metric is the map key. `per` is `None` only for `concurrent` (an instantaneous gauge, no
+ * window); `pool` is present only on a pool-scoped limit.
+ */
+export type LimitView = {
+    /**
+     * The cap amount (requests/tokens/cents, or the in-flight gauge for `concurrent`).
+     */
+    amount: number;
+    /**
+     * Where `on_exhaust: downgrade` sends exhausted traffic. Present iff downgrading.
+     */
+    downgrade_to?: string | null;
+    /**
+     * One of `requests` | `tokens` | `budget` | `concurrent`.
+     */
+    metric: string;
+    /**
+     * The budget-exhaustion behavior: `block` or `downgrade`. Absent = block (the default).
+     */
+    on_exhaust?: string | null;
+    /**
+     * The accounting window: `minute` | `hour` | `day` | `month` | `total`. Absent for `concurrent`.
+     */
+    per?: string | null;
+    /**
+     * The pool scope: present when the limit carries `pool: <name>` (it accounts and enforces
+     * only that pool's traffic, per `(group, pool)`); absent for a group-wide limit.
+     */
+    pool?: string | null;
 };
 
 /**
@@ -568,9 +884,12 @@ export type ModelUsageView = {
     provider: string;
     requests: number;
     /**
-     * Busbar's derived cost estimate in MICRO-units of `currency` (1e-6 USD — integer math,
-     * sub-cent precise, no float drift), from the operator's configured global prices. A consumer
-     * with its own per-model catalog recomputes from the raw token split instead.
+     * Busbar's derived cost estimate in MICRO-units of the ABSTRACT cost unit (1e-6 unit -
+     * integer math, sub-cent precise, no float drift), recomputed at read time from the raw token
+     * split x the operator's CURRENT per-model rate card. Busbar attaches no currency - the rate
+     * card's numbers are whatever unit the operator priced in; display/denomination is entirely
+     * the consumer's concern. A consumer with its own per-model catalog recomputes from the raw
+     * token split instead.
      */
     spend_micros: number;
     tokens_cache_creation: number;
@@ -592,8 +911,34 @@ export type ModelView = {
 };
 
 /**
- * A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain
- * (design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.
+ * `DELETE /overlay/{section}` — per-section overlay reset result: the section reverted, the
+ * resulting config version, and whether anything changed (`false` = the section had no overlay state,
+ * an idempotent no-op).
+ */
+export type OverlayResetView = {
+    /**
+     * `true` when the reset discarded overlay mutations; `false` for an already-empty section.
+     */
+    changed: boolean;
+    config_version: number;
+    /**
+     * The section that was reset (`groups` | `hooks` | `root` | `plugin_versions`).
+     */
+    reset: string;
+};
+
+/**
+ * A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain.
+ * Generic over the item view so every list endpoint shares one shape.
+ */
+export type PageGroupView = {
+    items: Array<GroupView>;
+    next_cursor: string | null;
+};
+
+/**
+ * A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain.
+ * Generic over the item view so every list endpoint shares one shape.
  */
 export type PageHookView = {
     items: Array<HookView>;
@@ -601,8 +946,8 @@ export type PageHookView = {
 };
 
 /**
- * A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain
- * (design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.
+ * A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain.
+ * Generic over the item view so every list endpoint shares one shape.
  */
 export type PageModelView = {
     items: Array<ModelView>;
@@ -610,8 +955,8 @@ export type PageModelView = {
 };
 
 /**
- * A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain
- * (design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.
+ * A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain.
+ * Generic over the item view so every list endpoint shares one shape.
  */
 export type PagePluginView = {
     items: Array<PluginView>;
@@ -619,8 +964,8 @@ export type PagePluginView = {
 };
 
 /**
- * A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain
- * (design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.
+ * A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain.
+ * Generic over the item view so every list endpoint shares one shape.
  */
 export type PagePoolView = {
     items: Array<PoolView>;
@@ -628,8 +973,8 @@ export type PagePoolView = {
 };
 
 /**
- * A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain
- * (design-admin-api-v1 §0.4). Generic over the item view so every list endpoint shares one shape.
+ * A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain.
+ * Generic over the item view so every list endpoint shares one shape.
  */
 export type PageProviderView = {
     items: Array<ProviderView>;
@@ -637,11 +982,161 @@ export type PageProviderView = {
 };
 
 /**
+ * The `PATCH /api/v1/admin/hooks/{name}/settings` body. Optimistic concurrency rides `If-Match` (H3).
+ */
+export type PatchSettingsReq = {
+    settings: {
+        [key: string]: unknown;
+    };
+};
+
+/**
+ * The result of installing a dynamic-library store plugin (`POST /api/v1/admin/plugins`). The
+ * engine RE-VERIFIED the uploaded bytes against the running trust posture (the client is never
+ * trusted), validated the ABI handshake, and atomically wrote the library (+ its manifest sidecar)
+ * into the plugins directory. `active` takes effect on the next store (re)load — a store change
+ * applies on restart / `store.module` apply, not as a hot swap (design: store install is
+ * boot-time/config-apply). Additive-only; never a secret.
+ */
+export type PluginInstallView = {
+    /**
+     * The library FILENAME written into the plugins directory (the handle `DELETE` takes).
+     */
+    file: string;
+    /**
+     * The store C-ABI (`interface_version`) the engine validated the library against.
+     */
+    interface_version: number;
+    /**
+     * The plugin name from its manifest (or the filename when unsigned).
+     */
+    name: string;
+    /**
+     * A human note: this install is durable in the folder but takes effect on the next store (re)load.
+     */
+    note: string;
+    /**
+     * The manifest publisher, when signed.
+     */
+    publisher?: string | null;
+    /**
+     * The server-side trust verdict from the RE-VERIFY: `"trusted"` | `"unverified"`. (A `"rejected"`
+     * verdict is an error, never a success body.)
+     */
+    trust: string;
+    /**
+     * The manifest version, when the upload carried a signed manifest.
+     */
+    version?: string | null;
+};
+
+/**
+ * The result of re-scanning the plugins directory (`POST /api/v1/admin/plugins/reload`): the
+ * current dynamic-library inventory, each with its ABI-validity. Reconciles the reported set to the
+ * folder (the folder is the source of truth), exactly as `config/reload` reconciles config to disk.
+ * A store change still applies on the next store (re)load, not as a hot swap.
+ */
+export type PluginReloadView = {
+    /**
+     * A human note on when a store change actually takes effect.
+     */
+    note: string;
+    /**
+     * The dynamic-library plugins now present in the directory, sorted by filename.
+     */
+    plugins: Array<PluginView>;
+};
+
+/**
+ * The `POST /api/v1/admin/plugins/rollback` body: the target library FILENAME to roll DOWN to.
+ */
+export type PluginRollbackReq = {
+    /**
+     * The plugin tarball FILENAME (in the plugins directory) carrying the prior version to pin to.
+     */
+    file: string;
+};
+
+/**
+ * The result of an EXPLICIT plugin ROLLBACK (`POST /api/v1/admin/plugins/rollback`, 1.5.0
+ * rollback-friendly versioning): the operator deliberately pinned a plugin DOWN to a prior version and
+ * the engine hot-swapped to that artifact. The pin is persisted (survives restart) and the trust
+ * floor was lowered to EXACTLY the pinned version for THIS plugin — a lower artifact still cannot
+ * load, and an automatic/silent replay of an old artifact is still refused (only this explicit,
+ * audited action lowered the floor). Additive-only; never a secret.
+ */
+export type PluginRollbackView = {
+    /**
+     * The now-live config version after the hot swap (the ETag the response also carries).
+     */
+    config_version: number;
+    /**
+     * The library FILENAME the rollback selected in the plugins directory.
+     */
+    file: string;
+    /**
+     * The plugin's canonical manifest name that was pinned.
+     */
+    name: string;
+    /**
+     * A human note on the rollback's semantics + durability.
+     */
+    note: string;
+    /**
+     * The manifest publisher of the pinned artifact (`busbar` = first-party).
+     */
+    publisher: string;
+    /**
+     * The version the plugin was pinned DOWN to (now serving), from the target artifact's manifest.
+     */
+    version: string;
+};
+
+/**
+ * `GET /plugins/{name}/schema` — the generalized, all-kinds sibling of [`HookSchemaView`]
+ * (plugin-settings-schema-SPEC.md). Carries `trust`/`source`/`schema_error` on top of
+ * `{name, schema}` so busbar-ui never has to infer trust state or the describe/manifest
+ * precedence rule from context — the server always picks exactly one source and reports which.
+ */
+export type PluginSchemaView = {
+    name: string;
+    /**
+     * The plugin's settings JSON Schema verbatim, or `null` — either because the manifest never
+     * set `settings_schema`, or (distinctly, see `schema_error`) because it did but the value
+     * failed to parse.
+     */
+    schema: unknown;
+    /**
+     * Set only when the manifest's `settings_schema` was present but failed to parse as JSON —
+     * `null` for a manifest that genuinely never set the field. Never collapsed into a bare
+     * `schema: null` (question #3, round-4 correction): a present-but-corrupt schema is a real
+     * authoring/packaging bug, not "this plugin simply has none."
+     */
+    schema_error: string | null;
+    /**
+     * `"describe"` when a currently-loaded `kind: hook` answered its live `describe` wire
+     * message (the existing describe-proxy behavior, unchanged); `"manifest"` otherwise. Lets
+     * busbar-ui explain "why does this form look different from what I expected" without
+     * implementing the describe/manifest precedence rule itself (question #3, round-4
+     * correction).
+     */
+    source: string;
+    /**
+     * `"trusted" | "unverified" | "rejected"` — the same vocabulary the plugin catalog already
+     * uses (never `"verified"`; question #8, round-4 correction).
+     */
+    trust: string;
+};
+
+/**
  * One plugin in the plugin catalog (`GET /api/v1/admin/plugins?type=`). A plugin is either
  * COMPILED-IN (baked into the binary, feature-gated — provably removable via `--no-default-features`)
- * or EXTERNAL (registered at runtime over socket/webhook). `active` is `Some(true/false)` where
- * activation is tracked (auth modules: in the chain?; external hooks: configured = true) and `None`
- * where it is a per-pool concern not summarized here (compiled-in ranking policies). Additive-only.
+ * or a signed DYNAMIC-LIBRARY plugin (a loadable `.so`/`.dll`/`.dylib`, dlopen'd over the signed
+ * plugin ABI — this covers `auth`, `hooks`, and `store` plugin kinds alike as of 1.5.0; the
+ * retired 1.4.x socket/webhook "external" transport is gone). `active` is `Some(true/false)`
+ * where activation is tracked (auth modules: in the chain?; hook plugins: configured = true;
+ * dynamic store: the configured `store.module`) and `None` where it is a per-pool concern not
+ * summarized here (compiled-in ranking policies). Additive-only.
  */
 export type PluginView = {
     /**
@@ -650,23 +1145,94 @@ export type PluginView = {
      */
     active: boolean | null;
     /**
-     * `"compiled-in"` or `"external"`.
+     * Why a dynamic-library plugin did not validate (`valid: false`) — a short, secret-free reason.
+     */
+    error?: string | null;
+    /**
+     * The artifact FILENAME in `plugins.dir` — the `{file}` path segment `DELETE
+     * /plugins/{file}` and `GET /plugins/{file}/schema` key off (E-003: a list row previously
+     * carried no field a client could feed straight back into either sibling endpoint; `target`
+     * is documented as the manifest NAME, not necessarily the on-disk filename, and is not a
+     * reliable substitute). `None` for compiled-in/external rows, which have no backing artifact
+     * to name. Additive; existing consumers reading only the pre-1.5.1 fields are unaffected.
+     */
+    file?: string | null;
+    /**
+     * `true` iff `GET /plugins/{file}/schema` would resolve this row's `file` to a manifest that
+     * declares `settings_schema` at all — i.e. iff `schema_url` below is non-null — so a plugin
+     * catalog can render which rows are configurable in one list call instead of a fetch per row
+     * (E-003). Mirrors `schema_url.is_some()`; kept as its own boolean rather than requiring the
+     * caller to null-check `schema_url` for the same fact. `false` for compiled-in/external rows
+     * (no manifest to carry a schema) and for a dynamic-library row whose manifest never set
+     * `settings_schema`. Additive.
+     */
+    has_schema: boolean;
+    /**
+     * The store C-ABI (`interface_version`) the manifest declares (dynamic-library plugins with a
+     * manifest). Operator-facing name for the "ABI" the engine speaks.
+     */
+    interface_version?: number | null;
+    /**
+     * `"compiled-in"` or `"plugin"` (a dlopen'd dynamic-library plugin — auth, hook, and store
+     * kinds alike as of 1.5.0's signed plugin ABI).
      */
     loader: string;
     name: string;
     /**
-     * For an external plugin, its transport target (socket path / webhook URL). `None` for compiled-in.
+     * The manifest's declared publisher (dynamic-library plugins with a manifest).
+     */
+    publisher?: string | null;
+    /**
+     * A manifest that SET `settings_schema` but whose value fails to parse (question #3's round-4
+     * correction, carried onto the list row too) — distinct from a manifest that never set the
+     * field at all (`schema_url: null`, this field also `None`). `schema_url` stays non-null in
+     * this case; the operator sees the row is degraded from the list alone, before ever following
+     * the URL.
+     */
+    schema_error?: string | null;
+    /**
+     * Server-resolved path to this plugin's `GET /plugins/{name}/schema` endpoint (questions
+     * #10/#11 of plugin-settings-schema-SPEC.md) — ALWAYS a relative path under the admin origin
+     * (the client MUST reject an absolute/cross-origin value rather than fetch it; this endpoint
+     * only ever emits the admin-prefixed relative form, never anything else). Non-null whenever the
+     * manifest declared a `settings_schema` AT ALL, even if it's unparseable (following it then
+     * surfaces `schema_error` — question #11, round-8 correction: a present-but-corrupt schema is a
+     * worse, distinct condition from "no schema declared", never folded into the same `null`).
+     * `null` for a compiled-in/external row (no manifest to carry a schema at all) and for any
+     * dynamic-library row whose manifest never set `settings_schema`.
+     */
+    schema_url?: string | null;
+    /**
+     * For a dynamic-library plugin, its NAME (not a socket path or URL — the retired 1.4.x
+     * transport target). `None` for compiled-in.
      */
     target: string | null;
     /**
-     * `"auth"` or `"hooks"` — the plugin TYPE (each a distinct engine contract).
+     * The server-side trust verdict for a dynamic-library plugin, re-evaluated against the running
+     * `plugins.trust` posture: `"trusted"` (signed by an allowlisted publisher), `"unverified"`
+     * (loaded but not verified — the posture permits it), or `"rejected"` (the `halt` posture would
+     * refuse it). `None` for compiled-in/external.
+     */
+    trust?: string | null;
+    /**
+     * `"auth"`, `"hooks"`, or `"store"` — the plugin TYPE (each a distinct engine contract).
      */
     type: string;
+    /**
+     * For a dynamic-library plugin: whether the library validated as a busbar store plugin the engine
+     * can load (ABI handshake). `None` for compiled-in/external.
+     */
+    valid?: boolean | null;
+    /**
+     * The plugin's semantic version, from its signed sidecar manifest (dynamic-library plugins only).
+     * `None` for compiled-in/external, or a dynamic plugin with no/invalid manifest.
+     */
+    version?: string | null;
 };
 
 /**
  * The LIVE per-pool detail read (`GET /api/v1/admin/pools/{name}`) — the reliability/capacity dashboard
- * data (design-admin-api-v1 §6.9): each member's breaker state, concurrency headroom, in-flight
+ * data: each member's breaker state, concurrency headroom, in-flight
  * count, latency EWMA, and success/error tallies, read from the SAME store signals the routing seam
  * ranks on. No LLM content, no credentials.
  */
@@ -738,7 +1304,7 @@ export type PoolMemberView = {
 /**
  * A pool in the topology read (`GET /api/v1/admin/pools`). Summary shape today: name + the member
  * models and their weights. LIVE per-member status (breaker state, available concurrency, latency
- * EWMA, budget/rate headroom — design-admin-api-v1 §6.9) is an additive follow-up; the field set
+ * EWMA, budget/rate headroom — design-admin-api-v1) is an additive follow-up; the field set
  * only grows.
  */
 export type PoolView = {
@@ -756,22 +1322,112 @@ export type ProviderView = {
 };
 
 /**
- * `POST /keys/{id}/rotate` — the key metadata plus the ONCE-shown fresh bearer secret.
+ * The `PUT /api/v1/admin/admin-auth` body: the replacement admin auth chain.
+ */
+export type PutAuthBody = {
+    /**
+     * The ordered admin auth module chain. Empty is the explicit open dev posture.
+     */
+    admin_auth: Array<string>;
+};
+
+/**
+ * The `POST /api/v1/admin/restart` body. Absent is the same as `{}`.
+ */
+export type RestartReq = {
+    /**
+     * Proceed even though no supervisor was detected. Exiting only restarts busbar if something
+     * restarts it; without this an undetected supervisor is refused rather than risking the
+     * gateway staying down.
+     */
+    confirm?: boolean;
+};
+
+/**
+ * `POST /restart` — accepted-and-draining result.
+ */
+export type RestartView = {
+    note: string;
+    restarting: boolean;
+    /**
+     * Whether a process supervisor was detected. False means the caller confirmed explicitly.
+     */
+    supervisor_detected: boolean;
+};
+
+/**
+ * `POST /keys/{id}/revoke` — the revoked key's id (denylisted without deleting the binding). 1.5.0.
+ */
+export type RevokeView = {
+    /**
+     * The id that was revoked (durably denylisted; the binding record remains).
+     */
+    revoked: string;
+};
+
+/**
+ * The `POST /api/v1/admin/config/rollback` request body. Optimistic concurrency rides `If-Match` (H3).
+ */
+export type RollbackReq = {
+    /**
+     * The retained version to restore.
+     */
+    version: number;
+};
+
+/**
+ * `POST /keys/{id}/rotate` — the key metadata plus the ONCE-shown fresh CREDENTIAL. Exactly one of
+ * `token`+`expires_at` (a 1.5.0 signed-token key: a new token at a new binding generation, every
+ * prior token now rejected) or `secret` (a legacy hashed-secret key) is present.
  */
 export type RotatedKeyView = {
-    allowed_pools: Array<string>;
-    budget_period: string;
+    allowed_pools: Array<string> | null;
     created_at: number;
     enabled: boolean;
-    id: string;
-    max_budget_cents: number | null;
-    name: string;
-    rpm_limit: number | null;
     /**
-     * The fresh bearer secret — shown EXACTLY once.
+     * Unix-seconds expiry of the re-minted signed token (present with `token`).
      */
-    secret: string;
-    tpm_limit: number | null;
+    expires_at?: number | null;
+    group: string | null;
+    id: string;
+    labels: {
+        [key: string]: string;
+    };
+    name: string;
+    /**
+     * The fresh bearer secret — shown EXACTLY once (legacy hashed-secret keys only).
+     */
+    secret?: string | null;
+    /**
+     * E-007: same field as `KeyView.state` — rotate does not change `enabled`/revoked/tombstoned
+     * status, so this reflects whatever the key's disposition already was (rotating a `disabled` or
+     * `revoked` key is legal and leaves it exactly that; only a `tombstoned` key refuses to rotate,
+     * which surfaces as 404 instead of this response).
+     */
+    state: string;
+    /**
+     * The fresh busbar-SIGNED token — shown EXACTLY once (signed-token keys).
+     */
+    token?: string | null;
+};
+
+/**
+ * `POST /signing-key/rotate` — the current key-signing key id plus the REVOKE-ALL warning. 1.5.0 is
+ * single-key: the actual swap is an operator action, so this reports intent, not an in-process swap.
+ */
+export type SigningKeyRotateView = {
+    /**
+     * The current signing-key id (`kid`) that tokens are minted under.
+     */
+    current_kid: string;
+    /**
+     * Human-readable guidance for the operator-driven lockstep rotation.
+     */
+    message: string;
+    /**
+     * Always `true`: rotating the signing key revokes every outstanding key (all must be re-minted).
+     */
+    revoke_all: boolean;
 };
 
 /**
@@ -784,15 +1440,41 @@ export type TopologyInfo = {
 };
 
 /**
+ * Partial update to an existing key. Keys are PURE AUTH (1.5.0, S1), so the mutable surface is
+ * auth-shaped only. Every field is optional; only the present ones change. The credential, name,
+ * allowed-pools, and labels are immutable here (rotate/recreate for those).
+ *
+ * `group` is THREE-STATE via serde double-option (`Option<Option<String>>`):
+ * - absent (`#[serde(default)]` -> outer `None`): leave the binding unchanged.
+ * - JSON `null` (`Some(None)`): UNBIND to no group (authed + unlimited).
+ * - a value (`Some(Some(name))`): REBIND to that group (must exist; mint-parity check).
+ *
+ * A single `Option<T>` could not tell absent from present-null, so a binding could never be
+ * cleared once set. `enabled` is a plain `Option<bool>` (a bool has no clear state). The 1.4.x
+ * cap fields (`rpm_limit`/`tpm_limit`/`max_budget_cents`) are GONE: limits live on the group.
+ */
+export type UpdateKeyReq = {
+    enabled?: boolean | null;
+    /**
+     * Rebind or UNBIND the key's group. Absent = unchanged; `null` = unbind. The double `Option`
+     * is what distinguishes those two, so the schema describes it as a nullable string.
+     */
+    group?: string | null;
+};
+
+/**
  * The raw consumption counts + the derived spend estimate — the one shape shared by `total`,
  * `by_model` rows, and `by_key` rows, so a consumer writes ONE aggregation reader.
  */
 export type UsageBreakdown = {
     requests: number;
     /**
-     * Busbar's derived cost estimate in MICRO-units of `currency` (1e-6 USD — integer math,
-     * sub-cent precise, no float drift), from the operator's configured global prices. A consumer
-     * with its own per-model catalog recomputes from the raw token split instead.
+     * Busbar's derived cost estimate in MICRO-units of the ABSTRACT cost unit (1e-6 unit -
+     * integer math, sub-cent precise, no float drift), recomputed at read time from the raw token
+     * split x the operator's CURRENT per-model rate card. Busbar attaches no currency - the rate
+     * card's numbers are whatever unit the operator priced in; display/denomination is entirely
+     * the consumer's concern. A consumer with its own per-model catalog recomputes from the raw
+     * token split instead.
      */
     spend_micros: number;
     tokens_cache_creation: number;
@@ -804,28 +1486,6 @@ export type UsageBreakdown = {
     tokens_output: number;
 };
 
-/**
- * Fleet METERING read (`GET /api/v1/admin/usage`) — the FinOps surface. Design principle:
- * busbar exposes the RAW INPUTS of cost, not just its own number. Every row carries the full token
- * SPLIT (input / output / cache-read / cache-creation — each prices differently), so a consumer
- * with its own (special/negotiated) price catalog reconstructs cost independently; `spend_micros`
- * is busbar's DERIVED estimate from the operator's configured global prices, computed at read time
- * (raw counts are what's stored — a price change re-prices history consistently).
- *
- * Time base — THE PINNED SHAPE RULING (external review R3 #1): a usage response is ALWAYS exactly
- * ONE fixed UTC-day metering bucket (`window`). `?window=<bucket-start-epoch>` selects a PAST
- * bucket (default: the current one); a multi-window series is the CLIENT fetching N buckets — or
- * a future additive `?from=&to=` returning an ARRAY OF THIS SAME PER-BUCKET SHAPE, never a
- * differently-shaped merged view. Billing periods aggregate client-side from day buckets (raw
- * counts are stored, so the math is exact). Deliberately decoupled from per-key budget windows so
- * per-model aggregation across keys is well-defined; budget ENFORCEMENT state lives on
- * `GET /keys/{id}/usage`, not here. Empty aggregations when governance is disabled. No secrets —
- * key ids/names only, never a token.
- *
- * LEDGER RULE (one loud contract sentence): `spend_micros` is a MUTABLE ESTIMATE — derived at
- * read time from the operator's CURRENT prices, so a price change re-prices history. Never store
- * it as a ledger charge; bill from the raw token split.
- */
 export type UsageView = {
     /**
      * Freshness marker: the epoch this read was computed at (counters accumulate live).
@@ -846,7 +1506,8 @@ export type UsageView = {
      */
     by_model: Array<ModelUsageView>;
     /**
-     * The denomination of every `spend_micros` in this response (`USAGE_CURRENCY`).
+     * The denomination of every `spend_micros` in this response (`USAGE_CURRENCY`, currently
+     * `"USD"`). A single-const source of truth so removal is one line. Emitted only here.
      */
     currency: string;
     /**
@@ -870,37 +1531,41 @@ export type UsageWindow = {
     start: number;
 };
 
-export type GetApiV1AdminAdminAuthData = {
+export type GetAdminAuthData = {
     body?: never;
     path?: never;
     query?: never;
     url: '/api/v1/admin/admin-auth';
 };
 
-export type GetApiV1AdminAdminAuthErrors = {
+export type GetAdminAuthErrors = {
     /**
-     * Missing/invalid admin credential
+     * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
      * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
      */
     403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminAdminAuthError = GetApiV1AdminAdminAuthErrors[keyof GetApiV1AdminAdminAuthErrors];
+export type GetAdminAuthError = GetAdminAuthErrors[keyof GetAdminAuthErrors];
 
-export type GetApiV1AdminAdminAuthResponses = {
+export type GetAdminAuthResponses = {
     /**
      * OK
      */
     200: AdminAuthView;
 };
 
-export type GetApiV1AdminAdminAuthResponse = GetApiV1AdminAdminAuthResponses[keyof GetApiV1AdminAdminAuthResponses];
+export type GetAdminAuthResponse = GetAdminAuthResponses[keyof GetAdminAuthResponses];
 
-export type PutApiV1AdminAdminAuthData = {
-    body?: never;
+export type PutAdminAuthData = {
+    body: PutAuthBody;
     headers?: {
         /**
          * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
@@ -912,9 +1577,9 @@ export type PutApiV1AdminAdminAuthData = {
     url: '/api/v1/admin/admin-auth';
 };
 
-export type PutApiV1AdminAdminAuthErrors = {
+export type PutAdminAuthErrors = {
     /**
-     * Unknown module / malformed body (error code `invalid_request`)
+     * `invalid_request`: unknown module / malformed body, malformed body / unknown field, malformed `If-Match` header
      */
     400: _Error;
     /**
@@ -926,27 +1591,31 @@ export type PutApiV1AdminAdminAuthErrors = {
      */
     403: _Error;
     /**
-     * Stale `If-Match` (`version_conflict`), or the new chain would lock the caller out (error code `conflict`)
+     * `conflict`: the new chain would lock the caller out | `version_conflict`: stale `If-Match` (re-read and retry)
      */
     409: _Error;
     /**
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type PutApiV1AdminAdminAuthError = PutApiV1AdminAdminAuthErrors[keyof PutApiV1AdminAdminAuthErrors];
+export type PutAdminAuthError = PutAdminAuthErrors[keyof PutAdminAuthErrors];
 
-export type PutApiV1AdminAdminAuthResponses = {
+export type PutAdminAuthResponses = {
     /**
      * The resource + apply metadata: `{configured, modules, applied, config_version, note}`
      */
     200: AdminAuthPutView;
 };
 
-export type PutApiV1AdminAdminAuthResponse = PutApiV1AdminAdminAuthResponses[keyof PutApiV1AdminAdminAuthResponses];
+export type PutAdminAuthResponse = PutAdminAuthResponses[keyof PutAdminAuthResponses];
 
-export type GetApiV1AdminAuditData = {
+export type GetAuditData = {
     body?: never;
     path?: never;
     query?: {
@@ -970,67 +1639,79 @@ export type GetApiV1AdminAuditData = {
     url: '/api/v1/admin/audit';
 };
 
-export type GetApiV1AdminAuditErrors = {
+export type GetAuditErrors = {
     /**
-     * Missing/invalid admin credential
+     * `invalid_request`: malformed or foreign pagination `cursor`
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
      * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
      */
     403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminAuditError = GetApiV1AdminAuditErrors[keyof GetApiV1AdminAuditErrors];
+export type GetAuditError = GetAuditErrors[keyof GetAuditErrors];
 
-export type GetApiV1AdminAuditResponses = {
+export type GetAuditResponses = {
     /**
      * OK
      */
     200: AuditPageView;
 };
 
-export type GetApiV1AdminAuditResponse = GetApiV1AdminAuditResponses[keyof GetApiV1AdminAuditResponses];
+export type GetAuditResponse = GetAuditResponses[keyof GetAuditResponses];
 
-export type GetApiV1AdminAuthData = {
+export type GetAuthData = {
     body?: never;
     path?: never;
     query?: never;
     url: '/api/v1/admin/auth';
 };
 
-export type GetApiV1AdminAuthErrors = {
+export type GetAuthErrors = {
     /**
-     * Missing/invalid admin credential
+     * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
      * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
      */
     403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminAuthError = GetApiV1AdminAuthErrors[keyof GetApiV1AdminAuthErrors];
+export type GetAuthError = GetAuthErrors[keyof GetAuthErrors];
 
-export type GetApiV1AdminAuthResponses = {
+export type GetAuthResponses = {
     /**
      * OK
      */
     200: AuthView;
 };
 
-export type GetApiV1AdminAuthResponse = GetApiV1AdminAuthResponses[keyof GetApiV1AdminAuthResponses];
+export type GetAuthResponse = GetAuthResponses[keyof GetAuthResponses];
 
-export type PostApiV1AdminAuthCacheFlushData = {
-    body?: never;
+export type PostAuthCacheFlushData = {
+    body: FlushCacheReq;
     path?: never;
     query?: never;
     url: '/api/v1/admin/auth/cache/flush';
 };
 
-export type PostApiV1AdminAuthCacheFlushErrors = {
+export type PostAuthCacheFlushErrors = {
     /**
-     * Malformed body (error code `invalid_request`)
+     * `invalid_request`: malformed body / unknown field
      */
     400: _Error;
     /**
@@ -1045,50 +1726,74 @@ export type PostApiV1AdminAuthCacheFlushErrors = {
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type PostApiV1AdminAuthCacheFlushError = PostApiV1AdminAuthCacheFlushErrors[keyof PostApiV1AdminAuthCacheFlushErrors];
+export type PostAuthCacheFlushError = PostAuthCacheFlushErrors[keyof PostAuthCacheFlushErrors];
 
-export type PostApiV1AdminAuthCacheFlushResponses = {
+export type PostAuthCacheFlushResponses = {
     /**
      * `{flushed}` — entries dropped
      */
     200: CacheFlushView;
 };
 
-export type PostApiV1AdminAuthCacheFlushResponse = PostApiV1AdminAuthCacheFlushResponses[keyof PostApiV1AdminAuthCacheFlushResponses];
+export type PostAuthCacheFlushResponse = PostAuthCacheFlushResponses[keyof PostAuthCacheFlushResponses];
 
-export type GetApiV1AdminConfigData = {
+export type GetConfigData = {
     body?: never;
     path?: never;
     query?: never;
     url: '/api/v1/admin/config';
 };
 
-export type GetApiV1AdminConfigErrors = {
+export type GetConfigErrors = {
     /**
-     * Missing/invalid admin credential
+     * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
      * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
      */
     403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminConfigError = GetApiV1AdminConfigErrors[keyof GetApiV1AdminConfigErrors];
+export type GetConfigError = GetConfigErrors[keyof GetConfigErrors];
 
-export type GetApiV1AdminConfigResponses = {
+export type GetConfigResponses = {
     /**
      * OK
      */
     200: EffectiveConfigView;
 };
 
-export type GetApiV1AdminConfigResponse = GetApiV1AdminConfigResponses[keyof GetApiV1AdminConfigResponses];
+export type GetConfigResponse = GetConfigResponses[keyof GetConfigResponses];
 
-export type PostApiV1AdminConfigApplyData = {
-    body?: never;
+export type PostConfigApplyData = {
+    /**
+     * Replace the running configuration.
+     */
+    body: {
+        /**
+         * A `config.yaml` deploy block, as JSON. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.
+         */
+        config: {
+            [key: string]: unknown;
+        };
+        /**
+         * A `providers.yaml` document, as JSON. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.
+         */
+        providers?: {
+            [key: string]: unknown;
+        };
+    };
     headers?: {
         /**
          * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
@@ -1100,9 +1805,9 @@ export type PostApiV1AdminConfigApplyData = {
     url: '/api/v1/admin/config/apply';
 };
 
-export type PostApiV1AdminConfigApplyErrors = {
+export type PostConfigApplyErrors = {
     /**
-     * Invalid config (error code `invalid_request`); nothing changed
+     * `invalid_request`: invalid config; nothing changed, malformed body / unknown field, malformed `If-Match` header
      */
     400: _Error;
     /**
@@ -1114,27 +1819,31 @@ export type PostApiV1AdminConfigApplyErrors = {
      */
     403: _Error;
     /**
-     * Stale `If-Match` (error code `version_conflict` — re-read and retry)
+     * `version_conflict`: stale `If-Match` (re-read and retry)
      */
     409: _Error;
     /**
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type PostApiV1AdminConfigApplyError = PostApiV1AdminConfigApplyErrors[keyof PostApiV1AdminConfigApplyErrors];
+export type PostConfigApplyError = PostConfigApplyErrors[keyof PostConfigApplyErrors];
 
-export type PostApiV1AdminConfigApplyResponses = {
+export type PostConfigApplyResponses = {
     /**
      * `{applied, config_version, note}`
      */
     200: ConfigApplyView;
 };
 
-export type PostApiV1AdminConfigApplyResponse = PostApiV1AdminConfigApplyResponses[keyof PostApiV1AdminConfigApplyResponses];
+export type PostConfigApplyResponse = PostConfigApplyResponses[keyof PostConfigApplyResponses];
 
-export type GetApiV1AdminConfigDiffData = {
+export type GetConfigDiffData = {
     body?: never;
     path?: never;
     query: {
@@ -1144,13 +1853,13 @@ export type GetApiV1AdminConfigDiffData = {
     url: '/api/v1/admin/config/diff';
 };
 
-export type GetApiV1AdminConfigDiffErrors = {
+export type GetConfigDiffErrors = {
     /**
-     * Missing/non-numeric `from` or `to` (error code `invalid_request`)
+     * `invalid_request`: missing or unknown required query parameter
      */
     400: _Error;
     /**
-     * Missing/invalid admin credential
+     * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
@@ -1158,32 +1867,36 @@ export type GetApiV1AdminConfigDiffErrors = {
      */
     403: _Error;
     /**
-     * Either version pruned or never recorded (error code `not_found`)
+     * `not_found`: unknown resource
      */
     404: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminConfigDiffError = GetApiV1AdminConfigDiffErrors[keyof GetApiV1AdminConfigDiffErrors];
+export type GetConfigDiffError = GetConfigDiffErrors[keyof GetConfigDiffErrors];
 
-export type GetApiV1AdminConfigDiffResponses = {
+export type GetConfigDiffResponses = {
     /**
      * The diff (hooks added/removed/changed + global-wiring delta)
      */
     200: ConfigDiffView;
 };
 
-export type GetApiV1AdminConfigDiffResponse = GetApiV1AdminConfigDiffResponses[keyof GetApiV1AdminConfigDiffResponses];
+export type GetConfigDiffResponse = GetConfigDiffResponses[keyof GetConfigDiffResponses];
 
-export type PostApiV1AdminConfigReloadData = {
+export type PostConfigReloadData = {
     body?: never;
     path?: never;
     query?: never;
     url: '/api/v1/admin/config/reload';
 };
 
-export type PostApiV1AdminConfigReloadErrors = {
+export type PostConfigReloadErrors = {
     /**
-     * Disk config invalid or no config files (error code `invalid_request`); nothing changed
+     * `invalid_request`: invalid config; nothing changed, ephemeral busbar: no disk config to read, merge onto, or revert to
      */
     400: _Error;
     /**
@@ -1198,21 +1911,25 @@ export type PostApiV1AdminConfigReloadErrors = {
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type PostApiV1AdminConfigReloadError = PostApiV1AdminConfigReloadErrors[keyof PostApiV1AdminConfigReloadErrors];
+export type PostConfigReloadError = PostConfigReloadErrors[keyof PostConfigReloadErrors];
 
-export type PostApiV1AdminConfigReloadResponses = {
+export type PostConfigReloadResponses = {
     /**
      * `{reloaded, config_version}`
      */
     200: ConfigReloadView;
 };
 
-export type PostApiV1AdminConfigReloadResponse = PostApiV1AdminConfigReloadResponses[keyof PostApiV1AdminConfigReloadResponses];
+export type PostConfigReloadResponse = PostConfigReloadResponses[keyof PostConfigReloadResponses];
 
-export type PostApiV1AdminConfigRollbackData = {
-    body?: never;
+export type PostConfigRollbackData = {
+    body: RollbackReq;
     headers?: {
         /**
          * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
@@ -1224,9 +1941,9 @@ export type PostApiV1AdminConfigRollbackData = {
     url: '/api/v1/admin/config/rollback';
 };
 
-export type PostApiV1AdminConfigRollbackErrors = {
+export type PostConfigRollbackErrors = {
     /**
-     * Snapshot fails re-validation (error code `invalid_request`)
+     * `invalid_request`: invalid config; nothing changed, malformed body / unknown field, malformed `If-Match` header
      */
     400: _Error;
     /**
@@ -1238,40 +1955,149 @@ export type PostApiV1AdminConfigRollbackErrors = {
      */
     403: _Error;
     /**
-     * Target version not retained (error code `not_found`)
+     * `not_found`: unknown resource
      */
     404: _Error;
     /**
-     * Stale `If-Match` (error code `version_conflict` — re-read and retry)
+     * `version_conflict`: stale `If-Match` (re-read and retry)
      */
     409: _Error;
     /**
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type PostApiV1AdminConfigRollbackError = PostApiV1AdminConfigRollbackErrors[keyof PostApiV1AdminConfigRollbackErrors];
+export type PostConfigRollbackError = PostConfigRollbackErrors[keyof PostConfigRollbackErrors];
 
-export type PostApiV1AdminConfigRollbackResponses = {
+export type PostConfigRollbackResponses = {
     /**
      * `{restored_version, config_version}`
      */
     200: ConfigRollbackView;
 };
 
-export type PostApiV1AdminConfigRollbackResponse = PostApiV1AdminConfigRollbackResponses[keyof PostApiV1AdminConfigRollbackResponses];
+export type PostConfigRollbackResponse = PostConfigRollbackResponses[keyof PostConfigRollbackResponses];
 
-export type PostApiV1AdminConfigValidateData = {
+export type GetConfigSettingsData = {
     body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/config/settings';
+};
+
+export type GetConfigSettingsErrors = {
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type GetConfigSettingsError = GetConfigSettingsErrors[keyof GetConfigSettingsErrors];
+
+export type GetConfigSettingsResponses = {
+    /**
+     * `{applied:false, config_version, settings}` (settings = the current root overrides)
+     */
+    200: ConfigSettingsView;
+};
+
+export type GetConfigSettingsResponse = GetConfigSettingsResponses[keyof GetConfigSettingsResponses];
+
+export type PutConfigSettingsData = {
+    /**
+     * The settings sections to replace, keyed by section name. The optional top-level boolean `persist` asserts the change MUST be stored in the config overlay: with `persist: true` a busbar that has no overlay refuses with `400 invalid_request` instead of applying the change in memory only. Omitted or `false` means the change is applied and stored where storage is available, and applied in memory only where it is not (the response `note` says which); `false` never suppresses storage. Every other top-level key must be a known settings section — an unknown key is a 400. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.
+     */
+    body: {
+        [key: string]: unknown;
+    };
+    headers?: {
+        /**
+         * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
+         */
+        'If-Match'?: string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/config/settings';
+};
+
+export type PutConfigSettingsErrors = {
+    /**
+     * `invalid_request`: invalid config; nothing changed, malformed body / unknown field, malformed `If-Match` header, ephemeral busbar: no disk config to read, merge onto, or revert to
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `version_conflict`: stale `If-Match` (re-read and retry)
+     */
+    409: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type PutConfigSettingsError = PutConfigSettingsErrors[keyof PutConfigSettingsErrors];
+
+export type PutConfigSettingsResponses = {
+    /**
+     * `{applied:true, config_version, settings, reload_to_apply, note}`
+     */
+    200: ConfigSettingsView;
+};
+
+export type PutConfigSettingsResponse = PutConfigSettingsResponses[keyof PutConfigSettingsResponses];
+
+export type PostConfigValidateData = {
+    /**
+     * Validate a configuration without applying it.
+     */
+    body: {
+        /**
+         * A `config.yaml` deploy block, as JSON. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.
+         */
+        config: {
+            [key: string]: unknown;
+        };
+        /**
+         * A `providers.yaml` document, as JSON. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.
+         */
+        providers?: {
+            [key: string]: unknown;
+        };
+    };
     path?: never;
     query?: never;
     url: '/api/v1/admin/config/validate';
 };
 
-export type PostApiV1AdminConfigValidateErrors = {
+export type PostConfigValidateErrors = {
     /**
-     * Malformed request body (error code `invalid_request`)
+     * `invalid_request`: malformed body / unknown field
      */
     400: _Error;
     /**
@@ -1286,20 +2112,24 @@ export type PostApiV1AdminConfigValidateErrors = {
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type PostApiV1AdminConfigValidateError = PostApiV1AdminConfigValidateErrors[keyof PostApiV1AdminConfigValidateErrors];
+export type PostConfigValidateError = PostConfigValidateErrors[keyof PostConfigValidateErrors];
 
-export type PostApiV1AdminConfigValidateResponses = {
+export type PostConfigValidateResponses = {
     /**
      * Verdict `{ok, errors}` (even for an invalid config)
      */
     200: ConfigValidateView;
 };
 
-export type PostApiV1AdminConfigValidateResponse = PostApiV1AdminConfigValidateResponses[keyof PostApiV1AdminConfigValidateResponses];
+export type PostConfigValidateResponse = PostConfigValidateResponses[keyof PostConfigValidateResponses];
 
-export type GetApiV1AdminConfigVersionsData = {
+export type GetConfigVersionsData = {
     body?: never;
     path?: never;
     query?: {
@@ -1315,38 +2145,11 @@ export type GetApiV1AdminConfigVersionsData = {
     url: '/api/v1/admin/config/versions';
 };
 
-export type GetApiV1AdminConfigVersionsErrors = {
+export type GetConfigVersionsErrors = {
     /**
-     * Missing/invalid admin credential
+     * `invalid_request`: malformed or foreign pagination `cursor`
      */
-    401: _Error;
-    /**
-     * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
-     */
-    403: _Error;
-};
-
-export type GetApiV1AdminConfigVersionsError = GetApiV1AdminConfigVersionsErrors[keyof GetApiV1AdminConfigVersionsErrors];
-
-export type GetApiV1AdminConfigVersionsResponses = {
-    /**
-     * OK
-     */
-    200: ConfigVersionPageView;
-};
-
-export type GetApiV1AdminConfigVersionsResponse = GetApiV1AdminConfigVersionsResponses[keyof GetApiV1AdminConfigVersionsResponses];
-
-export type GetApiV1AdminConfigVersionsByVData = {
-    body?: never;
-    path: {
-        v: number;
-    };
-    query?: never;
-    url: '/api/v1/admin/config/versions/{v}';
-};
-
-export type GetApiV1AdminConfigVersionsByVErrors = {
+    400: _Error;
     /**
      * Missing/invalid admin credential (error code `unauthorized`)
      */
@@ -1356,53 +2159,481 @@ export type GetApiV1AdminConfigVersionsByVErrors = {
      */
     403: _Error;
     /**
-     * Pruned or never recorded (error code `not_found`)
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
      */
-    404: _Error;
+    500: _Error;
 };
 
-export type GetApiV1AdminConfigVersionsByVError = GetApiV1AdminConfigVersionsByVErrors[keyof GetApiV1AdminConfigVersionsByVErrors];
+export type GetConfigVersionsError = GetConfigVersionsErrors[keyof GetConfigVersionsErrors];
 
-export type GetApiV1AdminConfigVersionsByVResponses = {
+export type GetConfigVersionsResponses = {
     /**
-     * The version (metadata + hooks + global_hooks)
+     * OK
      */
-    200: ConfigVersionDetailView;
+    200: ConfigVersionPageView;
 };
 
-export type GetApiV1AdminConfigVersionsByVResponse = GetApiV1AdminConfigVersionsByVResponses[keyof GetApiV1AdminConfigVersionsByVResponses];
+export type GetConfigVersionsResponse = GetConfigVersionsResponses[keyof GetConfigVersionsResponses];
 
-export type GetApiV1AdminHooksData = {
+export type GetConfigVersionsVData = {
     body?: never;
-    path?: never;
+    path: {
+        v: number;
+    };
     query?: never;
-    url: '/api/v1/admin/hooks';
+    url: '/api/v1/admin/config/versions/{v}';
 };
 
-export type GetApiV1AdminHooksErrors = {
+export type GetConfigVersionsVErrors = {
     /**
-     * Missing/invalid admin credential
+     * `invalid_request`: non-numeric path segment
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
      * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
      */
     403: _Error;
+    /**
+     * `not_found`: unknown resource
+     */
+    404: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminHooksError = GetApiV1AdminHooksErrors[keyof GetApiV1AdminHooksErrors];
+export type GetConfigVersionsVError = GetConfigVersionsVErrors[keyof GetConfigVersionsVErrors];
 
-export type GetApiV1AdminHooksResponses = {
+export type GetConfigVersionsVResponses = {
+    /**
+     * The version (metadata + hooks + global_hooks)
+     */
+    200: ConfigVersionDetailView;
+};
+
+export type GetConfigVersionsVResponse = GetConfigVersionsVResponses[keyof GetConfigVersionsVResponses];
+
+export type GetGroupsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/groups';
+};
+
+export type GetGroupsErrors = {
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type GetGroupsError = GetGroupsErrors[keyof GetGroupsErrors];
+
+export type GetGroupsResponses = {
+    /**
+     * OK
+     */
+    200: PageGroupView;
+};
+
+export type GetGroupsResponse = GetGroupsResponses[keyof GetGroupsResponses];
+
+export type PostGroupsData = {
+    body: {
+        /**
+         * A `groups:` entry, as JSON. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.
+         */
+        config: {
+            [key: string]: unknown;
+        };
+        /**
+         * The group name.
+         */
+        name: string;
+    };
+    headers?: {
+        /**
+         * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
+         */
+        'If-Match'?: string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/groups';
+};
+
+export type PostGroupsErrors = {
+    /**
+     * `invalid_request`: invalid tree — dangling/cyclic parent or depth, malformed body / unknown field, malformed `If-Match` header
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `conflict`: base-defined (edit config.yaml) | `version_conflict`: stale `If-Match` (re-read and retry)
+     */
+    409: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type PostGroupsError = PostGroupsErrors[keyof PostGroupsErrors];
+
+export type PostGroupsResponses = {
+    /**
+     * Replaced — the name existed (body is the group definition)
+     */
+    200: GroupView;
+    /**
+     * Created — the name is NEW (body is the group definition)
+     */
+    201: GroupView;
+};
+
+export type PostGroupsResponse = PostGroupsResponses[keyof PostGroupsResponses];
+
+export type DeleteGroupsNameData = {
+    body?: never;
+    headers?: {
+        /**
+         * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
+         */
+        'If-Match'?: string;
+    };
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/admin/groups/{name}';
+};
+
+export type DeleteGroupsNameErrors = {
+    /**
+     * `invalid_request`: malformed `If-Match` header
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `not_found`: unknown resource
+     */
+    404: _Error;
+    /**
+     * `conflict`: base-defined (edit config.yaml), another group still names it as parent, one or more keys are still bound (rebind/delete them first) | `version_conflict`: stale `If-Match` (re-read and retry)
+     */
+    409: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type DeleteGroupsNameError = DeleteGroupsNameErrors[keyof DeleteGroupsNameErrors];
+
+export type DeleteGroupsNameResponses = {
+    /**
+     * Removed
+     */
+    204: void;
+};
+
+export type DeleteGroupsNameResponse = DeleteGroupsNameResponses[keyof DeleteGroupsNameResponses];
+
+export type GetGroupsNameData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/admin/groups/{name}';
+};
+
+export type GetGroupsNameErrors = {
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `not_found`: unknown resource
+     */
+    404: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type GetGroupsNameError = GetGroupsNameErrors[keyof GetGroupsNameErrors];
+
+export type GetGroupsNameResponses = {
+    /**
+     * OK
+     */
+    200: GroupView;
+};
+
+export type GetGroupsNameResponse = GetGroupsNameResponses[keyof GetGroupsNameResponses];
+
+export type PatchGroupsNameData = {
+    /**
+     * A partial update: only the fields present are changed. `limits` and `child_default` REPLACE their whole value when present.
+     */
+    body: {
+        /**
+         * A `child_default:` template. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.
+         */
+        child_default?: {
+            [key: string]: unknown;
+        };
+        enabled?: boolean | null;
+        limits?: Array<{
+            [key: string]: unknown;
+        }> | null;
+        parent?: string | null;
+    };
+    headers?: {
+        /**
+         * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
+         */
+        'If-Match'?: string;
+    };
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/admin/groups/{name}';
+};
+
+export type PatchGroupsNameErrors = {
+    /**
+     * `invalid_request`: invalid tree — dangling/cyclic parent or depth, malformed body / unknown field, malformed `If-Match` header
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `not_found`: unknown resource
+     */
+    404: _Error;
+    /**
+     * `conflict`: base-defined (edit config.yaml) | `version_conflict`: stale `If-Match` (re-read and retry)
+     */
+    409: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type PatchGroupsNameError = PatchGroupsNameErrors[keyof PatchGroupsNameErrors];
+
+export type PatchGroupsNameResponses = {
+    /**
+     * The updated group
+     */
+    200: GroupView;
+};
+
+export type PatchGroupsNameResponse = PatchGroupsNameResponses[keyof PatchGroupsNameResponses];
+
+export type PutGroupsNameData = {
+    body: {
+        /**
+         * A `groups:` entry, as JSON. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.
+         */
+        config: {
+            [key: string]: unknown;
+        };
+    };
+    headers?: {
+        /**
+         * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
+         */
+        'If-Match'?: string;
+    };
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/admin/groups/{name}';
+};
+
+export type PutGroupsNameErrors = {
+    /**
+     * `invalid_request`: invalid tree — dangling/cyclic parent or depth, malformed body / unknown field, malformed `If-Match` header
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `not_found`: unknown resource
+     */
+    404: _Error;
+    /**
+     * `conflict`: base-defined (edit config.yaml) | `version_conflict`: stale `If-Match` (re-read and retry)
+     */
+    409: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type PutGroupsNameError = PutGroupsNameErrors[keyof PutGroupsNameErrors];
+
+export type PutGroupsNameResponses = {
+    /**
+     * The replaced group
+     */
+    200: GroupView;
+};
+
+export type PutGroupsNameResponse = PutGroupsNameResponses[keyof PutGroupsNameResponses];
+
+export type GetGroupsNameUsageData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/api/v1/admin/groups/{name}/usage';
+};
+
+export type GetGroupsNameUsageErrors = {
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `not_found`: unknown resource
+     */
+    404: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type GetGroupsNameUsageError = GetGroupsNameUsageErrors[keyof GetGroupsNameUsageErrors];
+
+export type GetGroupsNameUsageResponses = {
+    /**
+     * OK
+     */
+    200: GroupUsageView;
+};
+
+export type GetGroupsNameUsageResponse = GetGroupsNameUsageResponses[keyof GetGroupsNameUsageResponses];
+
+export type GetHooksData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/hooks';
+};
+
+export type GetHooksErrors = {
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type GetHooksError = GetHooksErrors[keyof GetHooksErrors];
+
+export type GetHooksResponses = {
     /**
      * OK
      */
     200: PageHookView;
 };
 
-export type GetApiV1AdminHooksResponse = GetApiV1AdminHooksResponses[keyof GetApiV1AdminHooksResponses];
+export type GetHooksResponse = GetHooksResponses[keyof GetHooksResponses];
 
-export type PostApiV1AdminHooksData = {
-    body?: never;
+export type PostHooksData = {
+    body: {
+        /**
+         * A `hooks:` entry, as JSON. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.
+         */
+        config: {
+            [key: string]: unknown;
+        };
+        /**
+         * The hook name.
+         */
+        name: string;
+    };
     headers?: {
         /**
          * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
@@ -1414,9 +2645,9 @@ export type PostApiV1AdminHooksData = {
     url: '/api/v1/admin/hooks';
 };
 
-export type PostApiV1AdminHooksErrors = {
+export type PostHooksErrors = {
     /**
-     * Malformed body or invalid definition (`invalid_request`)
+     * `invalid_request`: malformed body / unknown field, malformed `If-Match` header
      */
     400: _Error;
     /**
@@ -1424,22 +2655,26 @@ export type PostApiV1AdminHooksErrors = {
      */
     401: _Error;
     /**
-     * hooks-register principal may not register a content-seeing (`prompt`/`user`) or `global: true` hook (`forbidden`, §6.3)
+     * `forbidden`: a `hooks-register` principal may not touch a content-seeing (`prompt`/`user`) or `global` hook
      */
     403: _Error;
     /**
-     * Base-defined hook (edit config.yaml), grant change on an existing hook, or stale `If-Match` (`version_conflict`, §6.4)
+     * `conflict`: base-defined (edit config.yaml), grant change on an existing definition | `version_conflict`: stale `If-Match` (re-read and retry)
      */
     409: _Error;
     /**
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type PostApiV1AdminHooksError = PostApiV1AdminHooksErrors[keyof PostApiV1AdminHooksErrors];
+export type PostHooksError = PostHooksErrors[keyof PostHooksErrors];
 
-export type PostApiV1AdminHooksResponses = {
+export type PostHooksResponses = {
     /**
      * Replaced — the name existed (same-grant re-register; body is the hook definition)
      */
@@ -1450,9 +2685,9 @@ export type PostApiV1AdminHooksResponses = {
     201: HookView;
 };
 
-export type PostApiV1AdminHooksResponse = PostApiV1AdminHooksResponses[keyof PostApiV1AdminHooksResponses];
+export type PostHooksResponse = PostHooksResponses[keyof PostHooksResponses];
 
-export type DeleteApiV1AdminHooksByNameData = {
+export type DeleteHooksNameData = {
     body?: never;
     headers?: {
         /**
@@ -1467,41 +2702,49 @@ export type DeleteApiV1AdminHooksByNameData = {
     url: '/api/v1/admin/hooks/{name}';
 };
 
-export type DeleteApiV1AdminHooksByNameErrors = {
+export type DeleteHooksNameErrors = {
+    /**
+     * `invalid_request`: malformed `If-Match` header
+     */
+    400: _Error;
     /**
      * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
-     * A `hooks-register` principal may not delete a content-seeing (`prompt`/`user`) or `global` hook (error code `forbidden`, §6.3)
+     * `forbidden`: a `hooks-register` principal may not touch a content-seeing (`prompt`/`user`) or `global` hook
      */
     403: _Error;
     /**
-     * Unknown hook (error code `not_found`)
+     * `not_found`: unknown resource
      */
     404: _Error;
     /**
-     * Base-defined hook — read-only via the API; edit config.yaml (error code `conflict`)
+     * `conflict`: base-defined (edit config.yaml) | `version_conflict`: stale `If-Match` (re-read and retry)
      */
     409: _Error;
     /**
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type DeleteApiV1AdminHooksByNameError = DeleteApiV1AdminHooksByNameErrors[keyof DeleteApiV1AdminHooksByNameErrors];
+export type DeleteHooksNameError = DeleteHooksNameErrors[keyof DeleteHooksNameErrors];
 
-export type DeleteApiV1AdminHooksByNameResponses = {
+export type DeleteHooksNameResponses = {
     /**
      * Removed
      */
     204: void;
 };
 
-export type DeleteApiV1AdminHooksByNameResponse = DeleteApiV1AdminHooksByNameResponses[keyof DeleteApiV1AdminHooksByNameResponses];
+export type DeleteHooksNameResponse = DeleteHooksNameResponses[keyof DeleteHooksNameResponses];
 
-export type GetApiV1AdminHooksByNameData = {
+export type GetHooksNameData = {
     body?: never;
     path: {
         name: string;
@@ -1510,7 +2753,7 @@ export type GetApiV1AdminHooksByNameData = {
     url: '/api/v1/admin/hooks/{name}';
 };
 
-export type GetApiV1AdminHooksByNameErrors = {
+export type GetHooksNameErrors = {
     /**
      * Missing/invalid admin credential (error code `unauthorized`)
      */
@@ -1520,24 +2763,35 @@ export type GetApiV1AdminHooksByNameErrors = {
      */
     403: _Error;
     /**
-     * Unknown hook (error code `not_found`)
+     * `not_found`: unknown resource
      */
     404: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminHooksByNameError = GetApiV1AdminHooksByNameErrors[keyof GetApiV1AdminHooksByNameErrors];
+export type GetHooksNameError = GetHooksNameErrors[keyof GetHooksNameErrors];
 
-export type GetApiV1AdminHooksByNameResponses = {
+export type GetHooksNameResponses = {
     /**
      * OK
      */
     200: HookView;
 };
 
-export type GetApiV1AdminHooksByNameResponse = GetApiV1AdminHooksByNameResponses[keyof GetApiV1AdminHooksByNameResponses];
+export type GetHooksNameResponse = GetHooksNameResponses[keyof GetHooksNameResponses];
 
-export type PutApiV1AdminHooksByNameData = {
-    body?: never;
+export type PutHooksNameData = {
+    body: {
+        /**
+         * A `hooks:` entry, as JSON. The accepted shape is the config file's own, documented in the configuration reference; it is not restated here because several of its types parse a wire shape that does not match their field layout.
+         */
+        config: {
+            [key: string]: unknown;
+        };
+    };
     headers?: {
         /**
          * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
@@ -1551,9 +2805,9 @@ export type PutApiV1AdminHooksByNameData = {
     url: '/api/v1/admin/hooks/{name}';
 };
 
-export type PutApiV1AdminHooksByNameErrors = {
+export type PutHooksNameErrors = {
     /**
-     * Invalid definition (error code `invalid_request`)
+     * `invalid_request`: malformed body / unknown field, malformed `If-Match` header
      */
     400: _Error;
     /**
@@ -1561,35 +2815,39 @@ export type PutApiV1AdminHooksByNameErrors = {
      */
     401: _Error;
     /**
-     * A `hooks-register` principal may not replace a hook into a content-seeing (`prompt`/`user`) or `global` form (error code `forbidden`, §6.3)
+     * `forbidden`: a `hooks-register` principal may not touch a content-seeing (`prompt`/`user`) or `global` hook
      */
     403: _Error;
     /**
-     * Unknown hook (error code `not_found`)
+     * `not_found`: unknown resource
      */
     404: _Error;
     /**
-     * Base-defined hook, grant change (`conflict`), or stale `If-Match` (`version_conflict`)
+     * `conflict`: base-defined (edit config.yaml), grant change on an existing definition | `version_conflict`: stale `If-Match` (re-read and retry)
      */
     409: _Error;
     /**
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type PutApiV1AdminHooksByNameError = PutApiV1AdminHooksByNameErrors[keyof PutApiV1AdminHooksByNameErrors];
+export type PutHooksNameError = PutHooksNameErrors[keyof PutHooksNameErrors];
 
-export type PutApiV1AdminHooksByNameResponses = {
+export type PutHooksNameResponses = {
     /**
      * The replaced hook
      */
     200: HookView;
 };
 
-export type PutApiV1AdminHooksByNameResponse = PutApiV1AdminHooksByNameResponses[keyof PutApiV1AdminHooksByNameResponses];
+export type PutHooksNameResponse = PutHooksNameResponses[keyof PutHooksNameResponses];
 
-export type GetApiV1AdminHooksByNameHealthData = {
+export type GetHooksNameHealthData = {
     body?: never;
     path: {
         name: string;
@@ -1598,7 +2856,7 @@ export type GetApiV1AdminHooksByNameHealthData = {
     url: '/api/v1/admin/hooks/{name}/health';
 };
 
-export type GetApiV1AdminHooksByNameHealthErrors = {
+export type GetHooksNameHealthErrors = {
     /**
      * Missing/invalid admin credential (error code `unauthorized`)
      */
@@ -1608,23 +2866,27 @@ export type GetApiV1AdminHooksByNameHealthErrors = {
      */
     403: _Error;
     /**
-     * Unknown hook (error code `not_found`)
+     * `not_found`: unknown resource
      */
     404: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminHooksByNameHealthError = GetApiV1AdminHooksByNameHealthErrors[keyof GetApiV1AdminHooksByNameHealthErrors];
+export type GetHooksNameHealthError = GetHooksNameHealthErrors[keyof GetHooksNameHealthErrors];
 
-export type GetApiV1AdminHooksByNameHealthResponses = {
+export type GetHooksNameHealthResponses = {
     /**
      * OK (`reachable` may be null for webhook/non-unix)
      */
     200: HookHealthView;
 };
 
-export type GetApiV1AdminHooksByNameHealthResponse = GetApiV1AdminHooksByNameHealthResponses[keyof GetApiV1AdminHooksByNameHealthResponses];
+export type GetHooksNameHealthResponse = GetHooksNameHealthResponses[keyof GetHooksNameHealthResponses];
 
-export type GetApiV1AdminHooksByNameSchemaData = {
+export type GetHooksNameSchemaData = {
     body?: never;
     path: {
         name: string;
@@ -1633,7 +2895,7 @@ export type GetApiV1AdminHooksByNameSchemaData = {
     url: '/api/v1/admin/hooks/{name}/schema';
 };
 
-export type GetApiV1AdminHooksByNameSchemaErrors = {
+export type GetHooksNameSchemaErrors = {
     /**
      * Missing/invalid admin credential (error code `unauthorized`)
      */
@@ -1643,24 +2905,28 @@ export type GetApiV1AdminHooksByNameSchemaErrors = {
      */
     403: _Error;
     /**
-     * Unknown hook (error code `not_found`)
+     * `not_found`: unknown resource
      */
     404: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminHooksByNameSchemaError = GetApiV1AdminHooksByNameSchemaErrors[keyof GetApiV1AdminHooksByNameSchemaErrors];
+export type GetHooksNameSchemaError = GetHooksNameSchemaErrors[keyof GetHooksNameSchemaErrors];
 
-export type GetApiV1AdminHooksByNameSchemaResponses = {
+export type GetHooksNameSchemaResponses = {
     /**
      * `{name, schema}` (`schema` null when the hook doesn't answer describe)
      */
     200: HookSchemaView;
 };
 
-export type GetApiV1AdminHooksByNameSchemaResponse = GetApiV1AdminHooksByNameSchemaResponses[keyof GetApiV1AdminHooksByNameSchemaResponses];
+export type GetHooksNameSchemaResponse = GetHooksNameSchemaResponses[keyof GetHooksNameSchemaResponses];
 
-export type PatchApiV1AdminHooksByNameSettingsData = {
-    body?: never;
+export type PatchHooksNameSettingsData = {
+    body: PatchSettingsReq;
     headers?: {
         /**
          * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
@@ -1674,9 +2940,9 @@ export type PatchApiV1AdminHooksByNameSettingsData = {
     url: '/api/v1/admin/hooks/{name}/settings';
 };
 
-export type PatchApiV1AdminHooksByNameSettingsErrors = {
+export type PatchHooksNameSettingsErrors = {
     /**
-     * Hook did not acknowledge (error code `invalid_request`); nothing committed
+     * `invalid_request`: malformed body / unknown field, malformed `If-Match` header, the hook did not acknowledge; nothing committed
      */
     400: _Error;
     /**
@@ -1684,35 +2950,39 @@ export type PatchApiV1AdminHooksByNameSettingsErrors = {
      */
     401: _Error;
     /**
-     * A `hooks-register` principal may not push settings to a content-seeing (`prompt`/`user`) or `global` hook (error code `forbidden`, §6.3)
+     * `forbidden`: a `hooks-register` principal may not touch a content-seeing (`prompt`/`user`) or `global` hook
      */
     403: _Error;
     /**
-     * Unknown hook (error code `not_found`)
+     * `not_found`: unknown resource
      */
     404: _Error;
     /**
-     * Base-defined hook (`conflict`) or stale `If-Match` (`version_conflict`)
+     * `conflict`: base-defined (edit config.yaml), a config change landed during the settings push — retry | `version_conflict`: stale `If-Match` (re-read and retry)
      */
     409: _Error;
     /**
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type PatchApiV1AdminHooksByNameSettingsError = PatchApiV1AdminHooksByNameSettingsErrors[keyof PatchApiV1AdminHooksByNameSettingsErrors];
+export type PatchHooksNameSettingsError = PatchHooksNameSettingsErrors[keyof PatchHooksNameSettingsErrors];
 
-export type PatchApiV1AdminHooksByNameSettingsResponses = {
+export type PatchHooksNameSettingsResponses = {
     /**
      * Acked + committed (the updated hook)
      */
     200: HookView;
 };
 
-export type PatchApiV1AdminHooksByNameSettingsResponse = PatchApiV1AdminHooksByNameSettingsResponses[keyof PatchApiV1AdminHooksByNameSettingsResponses];
+export type PatchHooksNameSettingsResponse = PatchHooksNameSettingsResponses[keyof PatchHooksNameSettingsResponses];
 
-export type GetApiV1AdminHooksByNameStatusData = {
+export type GetHooksNameStatusData = {
     body?: never;
     path: {
         name: string;
@@ -1721,7 +2991,7 @@ export type GetApiV1AdminHooksByNameStatusData = {
     url: '/api/v1/admin/hooks/{name}/status';
 };
 
-export type GetApiV1AdminHooksByNameStatusErrors = {
+export type GetHooksNameStatusErrors = {
     /**
      * Missing/invalid admin credential (error code `unauthorized`)
      */
@@ -1731,52 +3001,60 @@ export type GetApiV1AdminHooksByNameStatusErrors = {
      */
     403: _Error;
     /**
-     * Unknown hook (error code `not_found`)
+     * `not_found`: unknown resource
      */
     404: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminHooksByNameStatusError = GetApiV1AdminHooksByNameStatusErrors[keyof GetApiV1AdminHooksByNameStatusErrors];
+export type GetHooksNameStatusError = GetHooksNameStatusErrors[keyof GetHooksNameStatusErrors];
 
-export type GetApiV1AdminHooksByNameStatusResponses = {
+export type GetHooksNameStatusResponses = {
     /**
      * `{name, desired, reported, drift, metrics, as_of, source}`
      */
     200: HookStatusView;
 };
 
-export type GetApiV1AdminHooksByNameStatusResponse = GetApiV1AdminHooksByNameStatusResponses[keyof GetApiV1AdminHooksByNameStatusResponses];
+export type GetHooksNameStatusResponse = GetHooksNameStatusResponses[keyof GetHooksNameStatusResponses];
 
-export type GetApiV1AdminInfoData = {
+export type GetInfoData = {
     body?: never;
     path?: never;
     query?: never;
     url: '/api/v1/admin/info';
 };
 
-export type GetApiV1AdminInfoErrors = {
+export type GetInfoErrors = {
     /**
-     * Missing/invalid admin credential
+     * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
      * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
      */
     403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminInfoError = GetApiV1AdminInfoErrors[keyof GetApiV1AdminInfoErrors];
+export type GetInfoError = GetInfoErrors[keyof GetInfoErrors];
 
-export type GetApiV1AdminInfoResponses = {
+export type GetInfoResponses = {
     /**
      * OK
      */
     200: InfoView;
 };
 
-export type GetApiV1AdminInfoResponse = GetApiV1AdminInfoResponses[keyof GetApiV1AdminInfoResponses];
+export type GetInfoResponse = GetInfoResponses[keyof GetInfoResponses];
 
-export type GetApiV1AdminKeysData = {
+export type GetKeysData = {
     body?: never;
     path?: never;
     query?: {
@@ -1789,6 +3067,10 @@ export type GetApiV1AdminKeysData = {
          */
         prefix?: string;
         /**
+         * Filter by bound group (a `user:<sub>` leaf's keys are one person's)
+         */
+        group?: string;
+        /**
          * Page size (default 200, max 1000)
          */
         limit?: string;
@@ -1796,46 +3078,54 @@ export type GetApiV1AdminKeysData = {
          * Opaque continuation cursor from `next_cursor`
          */
         cursor?: string;
+        /**
+         * E-007: set to `tombstoned` to include hard-deleted keys, which are otherwise omitted (each row's `state` reads `"tombstoned"`)
+         */
+        include?: string;
     };
     url: '/api/v1/admin/keys';
 };
 
-export type GetApiV1AdminKeysErrors = {
+export type GetKeysErrors = {
     /**
-     * Malformed/foreign pagination cursor (error code `invalid_request`)
+     * `invalid_request`: malformed or foreign pagination `cursor`, invalid query-parameter value
      */
     400: _Error;
     /**
-     * Missing/invalid admin credential
+     * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
      * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
      */
     403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminKeysError = GetApiV1AdminKeysErrors[keyof GetApiV1AdminKeysErrors];
+export type GetKeysError = GetKeysErrors[keyof GetKeysErrors];
 
-export type GetApiV1AdminKeysResponses = {
+export type GetKeysResponses = {
     /**
      * `{items, next_cursor}` — the cursor page envelope (next_cursor null at end)
      */
     200: KeyPageView;
 };
 
-export type GetApiV1AdminKeysResponse = GetApiV1AdminKeysResponses[keyof GetApiV1AdminKeysResponses];
+export type GetKeysResponse = GetKeysResponses[keyof GetKeysResponses];
 
-export type PostApiV1AdminKeysData = {
-    body?: never;
+export type PostKeysData = {
+    body: CreateKeyReq;
     path?: never;
     query?: never;
     url: '/api/v1/admin/keys';
 };
 
-export type PostApiV1AdminKeysErrors = {
+export type PostKeysErrors = {
     /**
-     * Malformed body / invalid budget or rate (error code `invalid_request`)
+     * `invalid_request`: malformed body / unknown field, an id or name exceeds its length cap, invalid mint-time `labels` — a reserved or non-Prometheus label name, or too many/too long, bad `expires_in` / `expires_at`, `parent` was given without `group`, a delegated `mint` credential may only issue keys BOUND to a group (`group` is required), invalid tree — dangling/cyclic parent or depth
      */
     400: _Error;
     /**
@@ -1843,31 +3133,35 @@ export type PostApiV1AdminKeysErrors = {
      */
     401: _Error;
     /**
-     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     * Authenticated but under-scoped: requires `mint` (error code `forbidden`)
      */
     403: _Error;
     /**
-     * An Idempotency-Key request is already in flight (error code `conflict`)
+     * `conflict`: governance is not enabled on this server, no signing key is configured for signed-token minting, an `Idempotency-Key` request is already in flight, the group is at the `limits.max_keys_per_principal` cap, base-defined (edit config.yaml)
      */
     409: _Error;
     /**
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type PostApiV1AdminKeysError = PostApiV1AdminKeysErrors[keyof PostApiV1AdminKeysErrors];
+export type PostKeysError = PostKeysErrors[keyof PostKeysErrors];
 
-export type PostApiV1AdminKeysResponses = {
+export type PostKeysResponses = {
     /**
      * Created (body includes the once-shown secret)
      */
     201: CreatedKeyView;
 };
 
-export type PostApiV1AdminKeysResponse = PostApiV1AdminKeysResponses[keyof PostApiV1AdminKeysResponses];
+export type PostKeysResponse = PostKeysResponses[keyof PostKeysResponses];
 
-export type DeleteApiV1AdminKeysByIdData = {
+export type DeleteKeysIdData = {
     body?: never;
     headers?: {
         /**
@@ -1882,9 +3176,9 @@ export type DeleteApiV1AdminKeysByIdData = {
     url: '/api/v1/admin/keys/{id}';
 };
 
-export type DeleteApiV1AdminKeysByIdErrors = {
+export type DeleteKeysIdErrors = {
     /**
-     * Malformed `If-Match` (error code `invalid_request`)
+     * `invalid_request`: malformed `If-Match` header, an id or name exceeds its length cap
      */
     400: _Error;
     /**
@@ -1896,31 +3190,35 @@ export type DeleteApiV1AdminKeysByIdErrors = {
      */
     403: _Error;
     /**
-     * Unknown key (error code `not_found`)
+     * `not_found`: unknown resource
      */
     404: _Error;
     /**
-     * Stale `If-Match` ETag (error code `version_conflict` — re-read and retry)
+     * `conflict`: governance is not enabled on this server | `version_conflict`: stale `If-Match` (re-read and retry)
      */
     409: _Error;
     /**
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type DeleteApiV1AdminKeysByIdError = DeleteApiV1AdminKeysByIdErrors[keyof DeleteApiV1AdminKeysByIdErrors];
+export type DeleteKeysIdError = DeleteKeysIdErrors[keyof DeleteKeysIdErrors];
 
-export type DeleteApiV1AdminKeysByIdResponses = {
+export type DeleteKeysIdResponses = {
     /**
      * Revoked — No Content
      */
     204: void;
 };
 
-export type DeleteApiV1AdminKeysByIdResponse = DeleteApiV1AdminKeysByIdResponses[keyof DeleteApiV1AdminKeysByIdResponses];
+export type DeleteKeysIdResponse = DeleteKeysIdResponses[keyof DeleteKeysIdResponses];
 
-export type GetApiV1AdminKeysByIdData = {
+export type GetKeysIdData = {
     body?: never;
     path: {
         id: string;
@@ -1929,7 +3227,11 @@ export type GetApiV1AdminKeysByIdData = {
     url: '/api/v1/admin/keys/{id}';
 };
 
-export type GetApiV1AdminKeysByIdErrors = {
+export type GetKeysIdErrors = {
+    /**
+     * `invalid_request`: an id or name exceeds its length cap
+     */
+    400: _Error;
     /**
      * Missing/invalid admin credential (error code `unauthorized`)
      */
@@ -1939,24 +3241,28 @@ export type GetApiV1AdminKeysByIdErrors = {
      */
     403: _Error;
     /**
-     * Unknown key (error code `not_found`)
+     * `not_found`: unknown resource, governance is not enabled on this server
      */
     404: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminKeysByIdError = GetApiV1AdminKeysByIdErrors[keyof GetApiV1AdminKeysByIdErrors];
+export type GetKeysIdError = GetKeysIdErrors[keyof GetKeysIdErrors];
 
-export type GetApiV1AdminKeysByIdResponses = {
+export type GetKeysIdResponses = {
     /**
      * Key metadata (+ `ETag` header)
      */
     200: KeyView;
 };
 
-export type GetApiV1AdminKeysByIdResponse = GetApiV1AdminKeysByIdResponses[keyof GetApiV1AdminKeysByIdResponses];
+export type GetKeysIdResponse = GetKeysIdResponses[keyof GetKeysIdResponses];
 
-export type PatchApiV1AdminKeysByIdData = {
-    body?: never;
+export type PatchKeysIdData = {
+    body: UpdateKeyReq;
     headers?: {
         /**
          * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
@@ -1970,9 +3276,9 @@ export type PatchApiV1AdminKeysByIdData = {
     url: '/api/v1/admin/keys/{id}';
 };
 
-export type PatchApiV1AdminKeysByIdErrors = {
+export type PatchKeysIdErrors = {
     /**
-     * Invalid budget/rate (error code `invalid_request`)
+     * `invalid_request`: malformed body / unknown field, malformed `If-Match` header, an id or name exceeds its length cap, the rebind target group does not exist
      */
     400: _Error;
     /**
@@ -1984,31 +3290,86 @@ export type PatchApiV1AdminKeysByIdErrors = {
      */
     403: _Error;
     /**
-     * Unknown key (error code `not_found`)
+     * `not_found`: unknown resource
      */
     404: _Error;
     /**
-     * Stale `If-Match` ETag (error code `version_conflict` — re-read and retry)
+     * `conflict`: governance is not enabled on this server, the group is at the `limits.max_keys_per_principal` cap | `version_conflict`: stale `If-Match` (re-read and retry)
      */
     409: _Error;
     /**
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type PatchApiV1AdminKeysByIdError = PatchApiV1AdminKeysByIdErrors[keyof PatchApiV1AdminKeysByIdErrors];
+export type PatchKeysIdError = PatchKeysIdErrors[keyof PatchKeysIdErrors];
 
-export type PatchApiV1AdminKeysByIdResponses = {
+export type PatchKeysIdResponses = {
     /**
      * Updated metadata
      */
     200: KeyView;
 };
 
-export type PatchApiV1AdminKeysByIdResponse = PatchApiV1AdminKeysByIdResponses[keyof PatchApiV1AdminKeysByIdResponses];
+export type PatchKeysIdResponse = PatchKeysIdResponses[keyof PatchKeysIdResponses];
 
-export type PostApiV1AdminKeysByIdRotateData = {
+export type PostKeysIdRevokeData = {
+    body?: never;
+    path: {
+        id: string;
+    };
+    query?: never;
+    url: '/api/v1/admin/keys/{id}/revoke';
+};
+
+export type PostKeysIdRevokeErrors = {
+    /**
+     * `invalid_request`: an id or name exceeds its length cap
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `not_found`: unknown resource
+     */
+    404: _Error;
+    /**
+     * `conflict`: governance is not enabled on this server
+     */
+    409: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type PostKeysIdRevokeError = PostKeysIdRevokeErrors[keyof PostKeysIdRevokeErrors];
+
+export type PostKeysIdRevokeResponses = {
+    /**
+     * `{revoked}` — the id, now denylisted
+     */
+    200: RevokeView;
+};
+
+export type PostKeysIdRevokeResponse = PostKeysIdRevokeResponses[keyof PostKeysIdRevokeResponses];
+
+export type PostKeysIdRotateData = {
     body?: never;
     path: {
         id: string;
@@ -2017,7 +3378,7 @@ export type PostApiV1AdminKeysByIdRotateData = {
     url: '/api/v1/admin/keys/{id}/rotate';
 };
 
-export type PostApiV1AdminKeysByIdRotateErrors = {
+export type PostKeysIdRotateErrors = {
     /**
      * Missing/invalid admin credential (error code `unauthorized`)
      */
@@ -2027,31 +3388,35 @@ export type PostApiV1AdminKeysByIdRotateErrors = {
      */
     403: _Error;
     /**
-     * Unknown key (error code `not_found`)
+     * `not_found`: unknown resource
      */
     404: _Error;
     /**
-     * An Idempotency-Key request is already in flight (error code `conflict`)
+     * `conflict`: governance is not enabled on this server, an `Idempotency-Key` request is already in flight
      */
     409: _Error;
     /**
      * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
      */
     429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type PostApiV1AdminKeysByIdRotateError = PostApiV1AdminKeysByIdRotateErrors[keyof PostApiV1AdminKeysByIdRotateErrors];
+export type PostKeysIdRotateError = PostKeysIdRotateErrors[keyof PostKeysIdRotateErrors];
 
-export type PostApiV1AdminKeysByIdRotateResponses = {
+export type PostKeysIdRotateResponses = {
     /**
      * Rotated (body includes the once-shown new secret; an Idempotency-Key retry replays it verbatim)
      */
     200: RotatedKeyView;
 };
 
-export type PostApiV1AdminKeysByIdRotateResponse = PostApiV1AdminKeysByIdRotateResponses[keyof PostApiV1AdminKeysByIdRotateResponses];
+export type PostKeysIdRotateResponse = PostKeysIdRotateResponses[keyof PostKeysIdRotateResponses];
 
-export type GetApiV1AdminKeysByIdUsageData = {
+export type GetKeysIdUsageData = {
     body?: never;
     path: {
         id: string;
@@ -2060,7 +3425,11 @@ export type GetApiV1AdminKeysByIdUsageData = {
     url: '/api/v1/admin/keys/{id}/usage';
 };
 
-export type GetApiV1AdminKeysByIdUsageErrors = {
+export type GetKeysIdUsageErrors = {
+    /**
+     * `invalid_request`: an id or name exceeds its length cap
+     */
+    400: _Error;
     /**
      * Missing/invalid admin credential (error code `unauthorized`)
      */
@@ -2070,72 +3439,84 @@ export type GetApiV1AdminKeysByIdUsageErrors = {
      */
     403: _Error;
     /**
-     * Unknown key (error code `not_found`)
+     * `not_found`: unknown resource, governance is not enabled on this server
      */
     404: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminKeysByIdUsageError = GetApiV1AdminKeysByIdUsageErrors[keyof GetApiV1AdminKeysByIdUsageErrors];
+export type GetKeysIdUsageError = GetKeysIdUsageErrors[keyof GetKeysIdUsageErrors];
 
-export type GetApiV1AdminKeysByIdUsageResponses = {
+export type GetKeysIdUsageResponses = {
     /**
      * Budget-window counters + `rate_headroom` (fraction of the tightest RPM/TPM cap left; null = uncapped)
      */
     200: KeyMeteringView;
 };
 
-export type GetApiV1AdminKeysByIdUsageResponse = GetApiV1AdminKeysByIdUsageResponses[keyof GetApiV1AdminKeysByIdUsageResponses];
+export type GetKeysIdUsageResponse = GetKeysIdUsageResponses[keyof GetKeysIdUsageResponses];
 
-export type GetApiV1AdminModelsData = {
+export type GetModelsData = {
     body?: never;
     path?: never;
     query?: never;
     url: '/api/v1/admin/models';
 };
 
-export type GetApiV1AdminModelsErrors = {
+export type GetModelsErrors = {
     /**
-     * Missing/invalid admin credential
+     * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
      * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
      */
     403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminModelsError = GetApiV1AdminModelsErrors[keyof GetApiV1AdminModelsErrors];
+export type GetModelsError = GetModelsErrors[keyof GetModelsErrors];
 
-export type GetApiV1AdminModelsResponses = {
+export type GetModelsResponses = {
     /**
      * OK
      */
     200: PageModelView;
 };
 
-export type GetApiV1AdminModelsResponse = GetApiV1AdminModelsResponses[keyof GetApiV1AdminModelsResponses];
+export type GetModelsResponse = GetModelsResponses[keyof GetModelsResponses];
 
-export type GetApiV1AdminOpenapiJsonData = {
+export type GetOpenapiJsonData = {
     body?: never;
     path?: never;
     query?: never;
     url: '/api/v1/admin/openapi.json';
 };
 
-export type GetApiV1AdminOpenapiJsonErrors = {
+export type GetOpenapiJsonErrors = {
     /**
-     * Missing/invalid admin credential
+     * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
      * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
      */
     403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminOpenapiJsonError = GetApiV1AdminOpenapiJsonErrors[keyof GetApiV1AdminOpenapiJsonErrors];
+export type GetOpenapiJsonError = GetOpenapiJsonErrors[keyof GetOpenapiJsonErrors];
 
-export type GetApiV1AdminOpenapiJsonResponses = {
+export type GetOpenapiJsonResponses = {
     /**
      * An OpenAPI 3.1 document (this document's shape)
      */
@@ -2144,43 +3525,331 @@ export type GetApiV1AdminOpenapiJsonResponses = {
     };
 };
 
-export type GetApiV1AdminOpenapiJsonResponse = GetApiV1AdminOpenapiJsonResponses[keyof GetApiV1AdminOpenapiJsonResponses];
+export type GetOpenapiJsonResponse = GetOpenapiJsonResponses[keyof GetOpenapiJsonResponses];
 
-export type GetApiV1AdminPluginsData = {
+export type DeleteOverlaySectionData = {
+    body?: never;
+    headers?: {
+        /**
+         * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
+         */
+        'If-Match'?: string;
+    };
+    path: {
+        section: 'groups' | 'hooks' | 'root' | 'plugin_versions';
+    };
+    query?: never;
+    url: '/api/v1/admin/overlay/{section}';
+};
+
+export type DeleteOverlaySectionErrors = {
+    /**
+     * `invalid_request`: unknown overlay section (expected `groups`|`hooks`|`root`|`plugin_versions`), malformed `If-Match` header, ephemeral busbar: no disk config to read, merge onto, or revert to, invalid config; nothing changed
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `version_conflict`: stale `If-Match` (re-read and retry)
+     */
+    409: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type DeleteOverlaySectionError = DeleteOverlaySectionErrors[keyof DeleteOverlaySectionErrors];
+
+export type DeleteOverlaySectionResponses = {
+    /**
+     * `{reset, config_version, changed}` — changed:false when the section had no overlay state
+     */
+    200: OverlayResetView;
+};
+
+export type DeleteOverlaySectionResponse = DeleteOverlaySectionResponses[keyof DeleteOverlaySectionResponses];
+
+export type GetPluginsData = {
     body?: never;
     path?: never;
     query: {
         /**
-         * Plugin type: `auth` | `hooks` (required)
+         * Plugin type: `auth` | `hooks` | `store` (required)
          */
         type: string;
     };
     url: '/api/v1/admin/plugins';
 };
 
-export type GetApiV1AdminPluginsErrors = {
+export type GetPluginsErrors = {
     /**
-     * Missing/invalid admin credential
+     * `invalid_request`: missing or unknown required query parameter
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
      * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
      */
     403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminPluginsError = GetApiV1AdminPluginsErrors[keyof GetApiV1AdminPluginsErrors];
+export type GetPluginsError = GetPluginsErrors[keyof GetPluginsErrors];
 
-export type GetApiV1AdminPluginsResponses = {
+export type GetPluginsResponses = {
     /**
      * OK
      */
     200: PagePluginView;
 };
 
-export type GetApiV1AdminPluginsResponse = GetApiV1AdminPluginsResponses[keyof GetApiV1AdminPluginsResponses];
+export type GetPluginsResponse = GetPluginsResponses[keyof GetPluginsResponses];
 
-export type GetApiV1AdminPoolsData = {
+export type PostPluginsData = {
+    body: InstallPluginReq;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/plugins';
+};
+
+export type PostPluginsErrors = {
+    /**
+     * `invalid_request`: malformed body / unknown field, invalid plugin filename, the artifact is not loadable — bad archive/manifest, or it fails structure/trust validation
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `conflict`: the upload is untrusted and not opted-in, the plugin name/alias collides with an already-installed plugin under a different filename
+     */
+    409: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type PostPluginsError = PostPluginsErrors[keyof PostPluginsErrors];
+
+export type PostPluginsResponses = {
+    /**
+     * Installed — `{file, name, interface_version, trust, version?, publisher?, note}`
+     */
+    201: PluginInstallView;
+};
+
+export type PostPluginsResponse = PostPluginsResponses[keyof PostPluginsResponses];
+
+export type PostPluginsReloadData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/plugins/reload';
+};
+
+export type PostPluginsReloadErrors = {
+    /**
+     * `invalid_request`: invalid config; nothing changed
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type PostPluginsReloadError = PostPluginsReloadErrors[keyof PostPluginsReloadErrors];
+
+export type PostPluginsReloadResponses = {
+    /**
+     * `{plugins, note}` — the current dynamic-library inventory
+     */
+    200: PluginReloadView;
+};
+
+export type PostPluginsReloadResponse = PostPluginsReloadResponses[keyof PostPluginsReloadResponses];
+
+export type PostPluginsRollbackData = {
+    body: PluginRollbackReq;
+    headers?: {
+        /**
+         * Optimistic concurrency: the resource's ETag from a prior read (or the ETag returned by the previous mutation). Stale = 409 `version_conflict` (re-read and retry), nothing changes; absent or `*` = unconditional.
+         */
+        'If-Match'?: string;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/plugins/rollback';
+};
+
+export type PostPluginsRollbackErrors = {
+    /**
+     * `invalid_request`: malformed body / unknown field, malformed `If-Match` header, invalid plugin filename, ephemeral busbar: no disk config to read, merge onto, or revert to
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `not_found`: unknown resource
+     */
+    404: _Error;
+    /**
+     * `conflict`: the artifact is not loadable — bad archive/manifest, or it fails structure/trust validation | `version_conflict`: stale `If-Match` (re-read and retry)
+     */
+    409: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type PostPluginsRollbackError = PostPluginsRollbackErrors[keyof PostPluginsRollbackErrors];
+
+export type PostPluginsRollbackResponses = {
+    /**
+     * `{plugin, version, config_version, plugins}` — rolled back and hot-swapped
+     */
+    200: PluginRollbackView;
+};
+
+export type PostPluginsRollbackResponse = PostPluginsRollbackResponses[keyof PostPluginsRollbackResponses];
+
+export type DeletePluginsFileData = {
+    body?: never;
+    path: {
+        file: string;
+    };
+    query?: never;
+    url: '/api/v1/admin/plugins/{file}';
+};
+
+export type DeletePluginsFileErrors = {
+    /**
+     * `invalid_request`: invalid plugin filename
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `not_found`: unknown resource
+     */
+    404: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type DeletePluginsFileError = DeletePluginsFileErrors[keyof DeletePluginsFileErrors];
+
+export type DeletePluginsFileResponses = {
+    /**
+     * Removed
+     */
+    204: void;
+};
+
+export type DeletePluginsFileResponse = DeletePluginsFileResponses[keyof DeletePluginsFileResponses];
+
+export type GetPluginsFileSchemaData = {
+    body?: never;
+    path: {
+        file: string;
+    };
+    query?: never;
+    url: '/api/v1/admin/plugins/{file}/schema';
+};
+
+export type GetPluginsFileSchemaErrors = {
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `not_found`: unknown resource
+     */
+    404: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type GetPluginsFileSchemaError = GetPluginsFileSchemaErrors[keyof GetPluginsFileSchemaErrors];
+
+export type GetPluginsFileSchemaResponses = {
+    /**
+     * `{name, schema, schema_error, trust, source}` — `schema` null (with `schema_error` null) when the manifest carries none; a manifest that SET `settings_schema` but failed to parse instead reports `schema_error` (never collapsed into the same null as "no schema"). `trust` is `trusted|unverified|rejected` (the catalog vocabulary). `source` is `describe` (a loaded hook answered live) or `manifest`
+     */
+    200: PluginSchemaView;
+};
+
+export type GetPluginsFileSchemaResponse = GetPluginsFileSchemaResponses[keyof GetPluginsFileSchemaResponses];
+
+export type GetPoolsData = {
     body?: never;
     path?: never;
     query?: {
@@ -2192,38 +3861,11 @@ export type GetApiV1AdminPoolsData = {
     url: '/api/v1/admin/pools';
 };
 
-export type GetApiV1AdminPoolsErrors = {
+export type GetPoolsErrors = {
     /**
-     * Missing/invalid admin credential
+     * `invalid_request`: invalid query-parameter value
      */
-    401: _Error;
-    /**
-     * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
-     */
-    403: _Error;
-};
-
-export type GetApiV1AdminPoolsError = GetApiV1AdminPoolsErrors[keyof GetApiV1AdminPoolsErrors];
-
-export type GetApiV1AdminPoolsResponses = {
-    /**
-     * OK
-     */
-    200: PagePoolView;
-};
-
-export type GetApiV1AdminPoolsResponse = GetApiV1AdminPoolsResponses[keyof GetApiV1AdminPoolsResponses];
-
-export type GetApiV1AdminPoolsByNameData = {
-    body?: never;
-    path: {
-        name: string;
-    };
-    query?: never;
-    url: '/api/v1/admin/pools/{name}';
-};
-
-export type GetApiV1AdminPoolsByNameErrors = {
+    400: _Error;
     /**
      * Missing/invalid admin credential (error code `unauthorized`)
      */
@@ -2233,52 +3875,181 @@ export type GetApiV1AdminPoolsByNameErrors = {
      */
     403: _Error;
     /**
-     * Unknown pool (error code `not_found`)
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
      */
-    404: _Error;
+    500: _Error;
 };
 
-export type GetApiV1AdminPoolsByNameError = GetApiV1AdminPoolsByNameErrors[keyof GetApiV1AdminPoolsByNameErrors];
+export type GetPoolsError = GetPoolsErrors[keyof GetPoolsErrors];
 
-export type GetApiV1AdminPoolsByNameResponses = {
+export type GetPoolsResponses = {
     /**
      * OK
      */
-    200: PoolDetailView;
+    200: PagePoolView;
 };
 
-export type GetApiV1AdminPoolsByNameResponse = GetApiV1AdminPoolsByNameResponses[keyof GetApiV1AdminPoolsByNameResponses];
+export type GetPoolsResponse = GetPoolsResponses[keyof GetPoolsResponses];
 
-export type GetApiV1AdminProvidersData = {
+export type GetPoolsNameData = {
     body?: never;
-    path?: never;
+    path: {
+        name: string;
+    };
     query?: never;
-    url: '/api/v1/admin/providers';
+    url: '/api/v1/admin/pools/{name}';
 };
 
-export type GetApiV1AdminProvidersErrors = {
+export type GetPoolsNameErrors = {
     /**
-     * Missing/invalid admin credential
+     * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
      * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
      */
     403: _Error;
+    /**
+     * `not_found`: unknown resource
+     */
+    404: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminProvidersError = GetApiV1AdminProvidersErrors[keyof GetApiV1AdminProvidersErrors];
+export type GetPoolsNameError = GetPoolsNameErrors[keyof GetPoolsNameErrors];
 
-export type GetApiV1AdminProvidersResponses = {
+export type GetPoolsNameResponses = {
+    /**
+     * OK
+     */
+    200: PoolDetailView;
+};
+
+export type GetPoolsNameResponse = GetPoolsNameResponses[keyof GetPoolsNameResponses];
+
+export type GetProvidersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/providers';
+};
+
+export type GetProvidersErrors = {
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type GetProvidersError = GetProvidersErrors[keyof GetProvidersErrors];
+
+export type GetProvidersResponses = {
     /**
      * OK
      */
     200: PageProviderView;
 };
 
-export type GetApiV1AdminProvidersResponse = GetApiV1AdminProvidersResponses[keyof GetApiV1AdminProvidersResponses];
+export type GetProvidersResponse = GetProvidersResponses[keyof GetProvidersResponses];
 
-export type GetApiV1AdminUsageData = {
+export type PostRestartData = {
+    body?: RestartReq;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/restart';
+};
+
+export type PostRestartErrors = {
+    /**
+     * `invalid_request`: malformed body / unknown field
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `conflict`: no process supervisor was detected, so exiting would leave busbar down; re-send with `confirm: true` if a supervisor will restart it, this process has no shutdown channel, so it cannot restart itself
+     */
+    409: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type PostRestartError = PostRestartErrors[keyof PostRestartErrors];
+
+export type PostRestartResponses = {
+    /**
+     * `{restarting, supervisor_detected, note}` — draining; in-flight requests finish first
+     */
+    202: RestartView;
+};
+
+export type PostRestartResponse = PostRestartResponses[keyof PostRestartResponses];
+
+export type PostSigningKeyRotateData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/signing-key/rotate';
+};
+
+export type PostSigningKeyRotateErrors = {
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * `conflict`: governance is not enabled on this server, no signing key is configured; nothing to rotate
+     */
+    409: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type PostSigningKeyRotateError = PostSigningKeyRotateErrors[keyof PostSigningKeyRotateErrors];
+
+export type PostSigningKeyRotateResponses = {
+    /**
+     * `{current_kid, revoke_all, message}` — the rotation intent + revoke-all warning
+     */
+    200: SigningKeyRotateView;
+};
+
+export type PostSigningKeyRotateResponse = PostSigningKeyRotateResponses[keyof PostSigningKeyRotateResponses];
+
+export type GetUsageData = {
     body?: never;
     path?: never;
     query?: {
@@ -2290,27 +4061,35 @@ export type GetApiV1AdminUsageData = {
     url: '/api/v1/admin/usage';
 };
 
-export type GetApiV1AdminUsageErrors = {
+export type GetUsageErrors = {
     /**
-     * Missing/invalid admin credential
+     * `invalid_request`: invalid query-parameter value
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
      */
     401: _Error;
     /**
      * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
      */
     403: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
 };
 
-export type GetApiV1AdminUsageError = GetApiV1AdminUsageErrors[keyof GetApiV1AdminUsageErrors];
+export type GetUsageError = GetUsageErrors[keyof GetUsageErrors];
 
-export type GetApiV1AdminUsageResponses = {
+export type GetUsageResponses = {
     /**
      * OK
      */
     200: UsageView;
 };
 
-export type GetApiV1AdminUsageResponse = GetApiV1AdminUsageResponses[keyof GetApiV1AdminUsageResponses];
+export type GetUsageResponse = GetUsageResponses[keyof GetUsageResponses];
 
 export type ClientOptions = {
     baseUrl: `${string}://${string}` | (string & {});

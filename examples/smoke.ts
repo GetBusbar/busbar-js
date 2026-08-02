@@ -1,6 +1,6 @@
 // Compile-only example proving the /info response is TYPED as InfoView.
 import { createClient, createConfig } from "@hey-api/client-fetch";
-import { getApiV1AdminInfo } from "../src";
+import { getInfo } from "../src";
 import type { InfoView } from "../src";
 
 const client = createClient(
@@ -11,7 +11,7 @@ const client = createClient(
 );
 
 export async function main(): Promise<void> {
-  const { data, error } = await getApiV1AdminInfo({ client });
+  const { data, error } = await getInfo({ client });
   if (error) throw error;
   const info: InfoView = data;              // TYPED — no cast, no `unknown`
   const version: string = info.version;     // .version is string

@@ -27,7 +27,7 @@ your endpoint and token, then call `GET /info` (see
 
 ```ts
 import { createClient, createConfig } from "@hey-api/client-fetch";
-import { getApiV1AdminInfo } from "@busbar/busbar-admin";
+import { getInfo } from "@busbar/busbar-admin";
 import type { InfoView } from "@busbar/busbar-admin";
 
 const client = createClient(
@@ -37,7 +37,7 @@ const client = createClient(
   }),
 );
 
-const { data, error } = await getApiV1AdminInfo({ client });
+const { data, error } = await getInfo({ client });
 if (error) throw error;
 
 // `data` is TYPED as InfoView — editor autocompletes .version, .topology, .build, ...
