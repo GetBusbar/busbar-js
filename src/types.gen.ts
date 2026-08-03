@@ -734,6 +734,17 @@ export type InfoView = {
 };
 
 /**
+ * `POST /api/v1/admin/plugins/inspect` request body. SAME shape as [`InstallPluginReq`] (question
+ * #7 — "same request body shape as `POST /plugins`") — `file` is accepted for shape parity with
+ * the install flow a UI composes around the same upload, but is otherwise UNUSED here: inspect
+ * never writes anything to disk, so there is no filename to bind an install would need.
+ */
+export type InspectPluginReq = {
+    file: string;
+    tarball_b64: string;
+};
+
+/**
  * The `POST /api/v1/admin/plugins` request body: install a SIGNED plugin tarball. The tarball
  * bytes ride as base64 (`tarball_b64`) — a plugin artifact is opaque binary, so base64 keeps it a
  * clean JSON field. The engine RE-VERIFIES the contained signed manifest server-side against the
@@ -1099,7 +1110,19 @@ export type PluginRollbackView = {
  * precedence rule from context — the server always picks exactly one source and reports which.
  */
 export type PluginSchemaView = {
+    /**
+     * The plugin's `kind` (`hook` | `secret` | …) from its manifest. Both `GET /plugins/{file}/schema`
+     * and `POST /plugins/inspect` emit it (`null` only when the plugin cannot be resolved to a
+     * manifest). Declared so codegen'd clients keep it.
+     */
+    kind?: string | null;
     name: string;
+    /**
+     * The kind-derived restart-scoping default (`busbar_plugin_sign::kind_restart_default`), so
+     * busbar-ui need not hardcode the kind→default table. Emitted by both schema endpoints (`null`
+     * only when the plugin has no resolvable manifest/kind). Declared so codegen'd clients keep it.
+     */
+    restart_required_default?: boolean | null;
     /**
      * The plugin's settings JSON Schema verbatim, or `null` — either because the manifest never
      * set `settings_schema`, or (distinctly, see `schema_error`) because it did but the value
@@ -1126,6 +1149,13 @@ export type PluginSchemaView = {
      * uses (never `"verified"`; question #8, round-4 correction).
      */
     trust: string;
+    /**
+     * The plugin's semantic version from its manifest. Present on `POST /plugins/inspect` (which
+     * previews an on-disk candidate's manifest); `null`/absent on `GET /plugins/{file}/schema`, which
+     * does not surface the version. Declared here so a codegen'd client keeps the field the inspect
+     * handler always sends, rather than silently dropping it.
+     */
+    version?: string | null;
 };
 
 /**
@@ -3666,6 +3696,47 @@ export type PostPluginsResponses = {
 };
 
 export type PostPluginsResponse = PostPluginsResponses[keyof PostPluginsResponses];
+
+export type PostPluginsInspectData = {
+    body: InspectPluginReq;
+    path?: never;
+    query?: never;
+    url: '/api/v1/admin/plugins/inspect';
+};
+
+export type PostPluginsInspectErrors = {
+    /**
+     * `invalid_request`: malformed body / unknown field
+     */
+    400: _Error;
+    /**
+     * Missing/invalid admin credential (error code `unauthorized`)
+     */
+    401: _Error;
+    /**
+     * Authenticated but under-scoped: requires `read-only` (error code `forbidden`)
+     */
+    403: _Error;
+    /**
+     * Per-principal mutation budget exhausted (error code `rate_limited`; `Retry-After` header)
+     */
+    429: _Error;
+    /**
+     * Internal failure (error code `internal`); the detail is logged server-side, never returned
+     */
+    500: _Error;
+};
+
+export type PostPluginsInspectError = PostPluginsInspectErrors[keyof PostPluginsInspectErrors];
+
+export type PostPluginsInspectResponses = {
+    /**
+     * `{name, version, kind, schema, schema_error, trust, source, restart_required_default}` — the same shape `GET /plugins/{file}/schema` carries, plus `name`/`version`/`kind`; an untrusted/rejected candidate is reported (`trust`), never refused
+     */
+    200: PluginSchemaView;
+};
+
+export type PostPluginsInspectResponse = PostPluginsInspectResponses[keyof PostPluginsInspectResponses];
 
 export type PostPluginsReloadData = {
     body?: never;
