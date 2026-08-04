@@ -2685,7 +2685,7 @@ export type PostHooksErrors = {
      */
     401: _Error;
     /**
-     * `forbidden`: a `hooks-register` principal may not touch a content-seeing (`prompt`/`user`) or `global` hook
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
      */
     403: _Error;
     /**
@@ -2742,7 +2742,7 @@ export type DeleteHooksNameErrors = {
      */
     401: _Error;
     /**
-     * `forbidden`: a `hooks-register` principal may not touch a content-seeing (`prompt`/`user`) or `global` hook
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
      */
     403: _Error;
     /**
@@ -2845,7 +2845,7 @@ export type PutHooksNameErrors = {
      */
     401: _Error;
     /**
-     * `forbidden`: a `hooks-register` principal may not touch a content-seeing (`prompt`/`user`) or `global` hook
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
      */
     403: _Error;
     /**
@@ -2980,7 +2980,7 @@ export type PatchHooksNameSettingsErrors = {
      */
     401: _Error;
     /**
-     * `forbidden`: a `hooks-register` principal may not touch a content-seeing (`prompt`/`user`) or `global` hook
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
      */
     403: _Error;
     /**
@@ -3155,7 +3155,7 @@ export type PostKeysData = {
 
 export type PostKeysErrors = {
     /**
-     * `invalid_request`: malformed body / unknown field, an id or name exceeds its length cap, invalid mint-time `labels` — a reserved or non-Prometheus label name, or too many/too long, bad `expires_in` / `expires_at`, `parent` was given without `group`, a delegated `mint` credential may only issue keys BOUND to a group (`group` is required), invalid tree — dangling/cyclic parent or depth
+     * `invalid_request`: malformed body / unknown field, an id or name exceeds its length cap, invalid mint-time `labels` — a reserved or non-Prometheus label name, or too many/too long, bad `expires_in` / `expires_at`, `parent` was given without `group`, invalid tree — dangling/cyclic parent or depth
      */
     400: _Error;
     /**
@@ -3163,7 +3163,7 @@ export type PostKeysErrors = {
      */
     401: _Error;
     /**
-     * Authenticated but under-scoped: requires `mint` (error code `forbidden`)
+     * Authenticated but under-scoped: requires `full` (error code `forbidden`)
      */
     403: _Error;
     /**
