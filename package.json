@@ -1,6 +1,6 @@
 {
   "name": "@busbar/busbar-admin",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "TypeScript SDK for the Busbar admin API (generated from the typed OpenAPI 3.1 schema).",
   "license": "Apache-2.0",
   "repository": {
