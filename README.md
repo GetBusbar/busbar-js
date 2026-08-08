@@ -9,11 +9,21 @@ every response is a real interface (`InfoView`, `TopologyInfo`, ...) — not
 
 ## Versioning
 
-The SDK carries its **own** semantic version, independent of the busbar server /
-OpenAPI `info.version` (currently `1.5.0`). The current release is **`0.2.0`**
-(the `1.5.0` spec added `operationId`s, which renamed every generated function —
-a breaking change from `0.1.0`). It
-targets the frozen, additive-only `/api/v1/admin` surface.
+- **SDK version:** `0.4.0`. The SDK carries its own semantic version, independent of
+  the busbar server it talks to.
+- **Generated from:** busbar OpenAPI `info.version` `1.5.3`, the bundled
+  [`openapi.json`](./openapi.json).
+
+It targets the frozen, additive-only `/api/v1/admin` surface.
+
+Neither number above is maintained by hand alone: CI runs
+`.github/check-readme-versions.py`, which fails the build if this section stops matching
+`package.json` and `openapi.json`. They went stale silently once, so now they cannot.
+
+### History
+
+`0.2.0` was the breaking release: the busbar `1.5.0` spec added `operationId`s, which
+renamed every generated function.
 
 ## Install
 
@@ -44,7 +54,7 @@ if (error) throw error;
 
 // `data` is TYPED as InfoView — editor autocompletes .version, .topology, .build, ...
 const info: InfoView = data;
-console.log("busbar version:", info.version);          // -> "1.4.0"
+console.log("busbar version:", info.version);          // -> "1.5.3"
 console.log("pools:", info.topology.pools);
 console.log("config version:", info.config_version);
 ```
