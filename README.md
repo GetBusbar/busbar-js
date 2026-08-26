@@ -1,5 +1,9 @@
 # @busbar/busbar-admin (TypeScript SDK)
 
+[![CI](https://github.com/GetBusbar/busbar-js/actions/workflows/ci.yml/badge.svg)](https://github.com/GetBusbar/busbar-js/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/GetBusbar/busbar-js/branch/main/graph/badge.svg)](https://codecov.io/gh/GetBusbar/busbar-js)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
 A typed TypeScript client for the **Busbar Admin API** (`/api/v1/admin`).
 
 Generated from the typed OpenAPI 3.1 schema in [`openapi.json`](./openapi.json)
