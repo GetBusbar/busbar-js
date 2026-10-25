@@ -1,0 +1,22 @@
+# Imported from .github/workflows/ci.yml by `modernci import github`.
+to: dev
+checks:
+  build:
+    run: |
+      set -e
+      # Install deps (pinned)
+      npm ci </dev/null
+      # Regenerate client from openapi.json
+      npm run generate </dev/null
+      # Fail if the committed client is stale
+      ( bash -e /dev/fd/3 3<<'MODERNCI_STEP' </dev/null
+      git diff --exit-code -- src \
+        || (echo "::error::Generated client is out of date. Run 'npm run generate' and commit." && exit 1)
+      MODERNCI_STEP
+      )
+      # Typecheck (proves the client + typed example compile)
+      npm run typecheck </dev/null
+    requires:
+    - node20
+env:
+  CI: 'true'
