@@ -17,6 +17,6 @@ checks:
       # Typecheck (proves the client + typed example compile)
       npm run typecheck </dev/null
     requires:
-    - node20
+    - node22
 env:
   CI: 'true'
