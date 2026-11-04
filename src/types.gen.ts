@@ -1726,8 +1726,8 @@ export type ListView = {
  */
 export type McpCapabilityView = {
     /**
-     * The digest the operator approved, when there is one. A rejected or pending capability has
-     * none, and reporting the last OBSERVED digest here would read as an approval.
+     * The digest held by the kernel, when there is one. Rejection or pending status does not imply
+     * that this historical or configured approval currently permits serving.
      */
     approved_digest: string | null;
     /**
@@ -1803,7 +1803,7 @@ export type McpTrustView = {
      */
     removed: Array<string>;
     /**
-     * `pending`, `approved`, `quarantined`, `suspended` or `error`. DERIVED from the approval and
+     * `pending`, `approved`, `quarantined` or `error`. DERIVED from the approval and
      * the last sighting on every read, so there is no stored state to go stale.
      */
     state: string;
@@ -1849,6 +1849,103 @@ export type ModelUsageView = {
 export type ModelView = {
     model: string;
     provider: string;
+};
+
+/**
+ * THE MUTATION RESPONSE for an upsert/settings write: the stored definition, PLUS the
+ * restart-required signal for boot-bound routes, planes and export instances or projections.
+ *
+ * `#[serde(flatten)]` keeps the definition's own fields exactly where they have always been, so the
+ * signal is purely ADDITIVE — and both signal fields are omitted entirely when nothing is pending,
+ * so the ordinary body is byte-identical to what it was. This is the `export:` named map's sibling of
+ * `PUT /config/settings`'s `reload_to_apply`/`note` pair (`handlers::reload_to_apply_fields`), which
+ * reports the same class of boot-frozen change for the single-value settings surface.
+ */
+export type MutatedDefView = {
+    /**
+     * `identity-providers` ONLY: whether a `browser_login:` block is configured, the presence that
+     * puts a button on the hosted login page.
+     */
+    browser_login_configured?: boolean | null;
+    /**
+     * `agents` ONLY: whether an approved card FINGERPRINT is pinned yet. A registration with a
+     * root but no fingerprint is the normal state of a fresh entry awaiting approval, and it is
+     * the state an operator most needs to be able to see.
+     */
+    fingerprint_pinned?: boolean | null;
+    /**
+     * `identity-providers` ONLY: the per-provider ADMIN CEILING (`read-only` | `full`). There is no
+     * `none` token: `Scope::parse_ceiling` rejects it, because a ceiling
+     * caps what a grant can reach and cannot express the absence of one.
+     * `None` ⇒ the definition names no ceiling, so the most restrictive default applies. Omitted
+     * entirely for a section that carries no ceiling.
+     */
+    max_admin_scope?: string | null;
+    /**
+     * The `module:` backing this instance (a built-in name or a signed-plugin name/alias).
+     *
+     * ALWAYS present, matching 1.5.5's wire shape byte-for-byte (`required` includes `module`,
+     * schema type `"string"`, never nullable): 1.5.5 had no named-map section whose entries
+     * carried no module, so it has no representation for one, and the ruling is 1:1 with 1.5.5
+     * rather than inventing a new shape. EMPTY-STRINGED, not omitted, for a section whose entries
+     * are not plugin instances -- today `agents:`, whose entries describe endpoints somebody else
+     * runs (`NamedMapSection::requires_module`). Every section that HAS a module requires it to be
+     * non-empty, so an empty string is unambiguous for "no module" without a `skip_serializing_if`
+     * that would shrink `required` below 1.5.5's.
+     */
+    module: string;
+    /**
+     * The instance NAME: the map key, and the token every reference site uses.
+     */
+    name: string;
+    /**
+     * The operator-facing sentence for [`Self::reload_to_apply`]; omitted with it.
+     */
+    note?: string | null;
+    /**
+     * `agents` ONLY: which authenticity root this registration is pinned to (`jws_issuer_key` |
+     * `cert_spki` | `mtls` | `unpinned`). Projected because an operator scanning a registration
+     * list needs to SEE which entries have no root; a mechanism that could only be discovered by
+     * reading the config file is a mechanism nobody audits.
+     */
+    pin_mechanism?: string | null;
+    /**
+     * The plugin-route PATHS this mutation declared that the process cannot serve until it restarts,
+     * because the axum router registers each path once, at boot, and a config apply swaps only
+     * `Arc<App>`; then the plane SECTIONS it first wrote whose plane the process did not open at
+     * boot (a plane is opened once, at process start, when its section is configured); and export
+     * instances whose membership, module or projection differs from the boot-opened sink.
+     * Empty and omitted when this mutation leaves no boot-bound change.
+     */
+    reload_to_apply?: Array<string>;
+    /**
+     * `agents` ONLY: the re-verification cadence this registration carries, as written. The
+     * backend `url:` is deliberately NOT projected here: it is the real remote endpoint and is
+     * never client-visible.
+     */
+    reverify_ttl?: string | null;
+    /**
+     * The KEY NAMES of the module's opaque settings bag, sorted, WITHOUT their values, the
+     * redacted projection of `settings:`. Operator/API-owned and never interpreted here, but also
+     * never a place a VALUE can leak from: a settings value may be a credential (see the type doc),
+     * and this surface is reachable at READ-ONLY admin scope. An empty bag ⇒ an empty list. The
+     * values are readable only where they are writable: the config file and the config overlay.
+     */
+    settings_keys: Array<string>;
+    /**
+     * `identity-providers` ONLY: whether a `token:` secret REFERENCE is configured (the built-in
+     * `admin-tokens` operator credential). The reference itself is never projected.
+     */
+    token_configured?: boolean | null;
+    /**
+     * Set ONLY on an entry that is STORED in the config overlay but could NOT be parsed into this
+     * section's typed config by this binary (a downgrade whose struct lost a field, a hand-edited
+     * overlay); the value is the parse error. Such an entry is dropped at every rebuild, so it is
+     * NOT live: `module`/`settings_keys` are the raw stored document's best-effort projection, not
+     * a resolved definition. Present so the drop is DISCOVERABLE here rather than only in a boot
+     * log line. Absent (and omitted from the body) for every live definition.
+     */
+    unparseable?: string | null;
 };
 
 /**
@@ -2017,6 +2114,15 @@ export type PageNamedDefView = {
  */
 export type PagePluginView = {
     items: Array<PluginView>;
+    next_cursor: string | null;
+};
+
+/**
+ * A cursor-paginated list envelope. `items` is this page; `next_cursor` is `Some` when more remain.
+ * Generic over the item view so every list endpoint shares one shape.
+ */
+export type PagePoolDetailView = {
+    items: Array<PoolDetailView>;
     next_cursor: string | null;
 };
 
@@ -2430,6 +2536,13 @@ export type PoolDetailView = {
     members: Array<PoolMemberStatusView>;
     name: string;
 };
+
+/**
+ * `GET /pools`: summary pages by default or with `detail=false`; live member-status pages with
+ * `detail=true`. Untagged because both branches retain the existing `{items, next_cursor}` envelope.
+ * Use an inclusive union: empty pages (and permissive summary schemas) can match both branches.
+ */
+export type PoolListView = PagePoolView | PagePoolDetailView;
 
 /**
  * One member's live status within a pool. The breaker signal is the release-exposed
@@ -3204,7 +3317,7 @@ export type PutApiV1AdminAgentsByNameResponses = {
     /**
      * The stored agent definition. Additionally carries `reload_to_apply` (+ a `note`) for a new unmounted plugin route, an unopened plane section, or an export instance whose membership, module or streams/fields projection differs from boot. New route paths answer 404 until restart; push exports keep their boot-opened instances and projections. Both fields are omitted when nothing is pending
      */
-    200: NamedDefView;
+    200: MutatedDefView;
 };
 
 export type PutApiV1AdminAgentsByNameResponse = PutApiV1AdminAgentsByNameResponses[keyof PutApiV1AdminAgentsByNameResponses];
@@ -3351,7 +3464,7 @@ export type PatchApiV1AdminAgentsByNameSettingsResponses = {
     /**
      * The updated agent definition (same `reload_to_apply` restart signal as the PUT; same-module export settings refresh live, while any outstanding boot-bound export instance or projection remains reported)
      */
-    200: NamedDefView;
+    200: MutatedDefView;
 };
 
 export type PatchApiV1AdminAgentsByNameSettingsResponse = PatchApiV1AdminAgentsByNameSettingsResponses[keyof PatchApiV1AdminAgentsByNameSettingsResponses];
@@ -3564,7 +3677,7 @@ export type GetApiV1AdminAuthResponses = {
 export type GetApiV1AdminAuthResponse = GetApiV1AdminAuthResponses[keyof GetApiV1AdminAuthResponses];
 
 export type PostApiV1AdminAuthCacheFlushData = {
-    body: FlushCacheReq;
+    body?: FlushCacheReq;
     path?: never;
     query?: never;
     url: '/api/v1/admin/auth/cache/flush';
@@ -4403,7 +4516,7 @@ export type PutApiV1AdminExportByNameResponses = {
     /**
      * The stored exporter definition. Additionally carries `reload_to_apply` (+ a `note`) for a new unmounted plugin route, an unopened plane section, or an export instance whose membership, module or streams/fields projection differs from boot. New route paths answer 404 until restart; push exports keep their boot-opened instances and projections. Both fields are omitted when nothing is pending
      */
-    200: NamedDefView;
+    200: MutatedDefView;
 };
 
 export type PutApiV1AdminExportByNameResponse = PutApiV1AdminExportByNameResponses[keyof PutApiV1AdminExportByNameResponses];
@@ -4464,7 +4577,7 @@ export type PatchApiV1AdminExportByNameSettingsResponses = {
     /**
      * The updated exporter definition (same `reload_to_apply` restart signal as the PUT; same-module export settings refresh live, while any outstanding boot-bound export instance or projection remains reported)
      */
-    200: NamedDefView;
+    200: MutatedDefView;
 };
 
 export type PatchApiV1AdminExportByNameSettingsResponse = PatchApiV1AdminExportByNameSettingsResponses[keyof PatchApiV1AdminExportByNameSettingsResponses];
@@ -5538,7 +5651,7 @@ export type PutApiV1AdminIdentityProvidersByNameResponses = {
     /**
      * The stored identity-provider definition. Additionally carries `reload_to_apply` (+ a `note`) for a new unmounted plugin route, an unopened plane section, or an export instance whose membership, module or streams/fields projection differs from boot. New route paths answer 404 until restart; push exports keep their boot-opened instances and projections. Both fields are omitted when nothing is pending
      */
-    200: NamedDefView;
+    200: MutatedDefView;
 };
 
 export type PutApiV1AdminIdentityProvidersByNameResponse = PutApiV1AdminIdentityProvidersByNameResponses[keyof PutApiV1AdminIdentityProvidersByNameResponses];
@@ -5599,7 +5712,7 @@ export type PatchApiV1AdminIdentityProvidersByNameSettingsResponses = {
     /**
      * The updated identity-provider definition (same `reload_to_apply` restart signal as the PUT; same-module export settings refresh live, while any outstanding boot-bound export instance or projection remains reported)
      */
-    200: NamedDefView;
+    200: MutatedDefView;
 };
 
 export type PatchApiV1AdminIdentityProvidersByNameSettingsResponse = PatchApiV1AdminIdentityProvidersByNameSettingsResponses[keyof PatchApiV1AdminIdentityProvidersByNameSettingsResponses];
@@ -6951,7 +7064,7 @@ export type GetApiV1AdminPoolsResponses = {
     /**
      * OK
      */
-    200: PagePoolView;
+    200: PoolListView;
 };
 
 export type GetApiV1AdminPoolsResponse = GetApiV1AdminPoolsResponses[keyof GetApiV1AdminPoolsResponses];
@@ -7353,7 +7466,7 @@ export type PutApiV1AdminToolsByNameResponses = {
     /**
      * The stored mcp-server definition. Additionally carries `reload_to_apply` (+ a `note`) for a new unmounted plugin route, an unopened plane section, or an export instance whose membership, module or streams/fields projection differs from boot. New route paths answer 404 until restart; push exports keep their boot-opened instances and projections. Both fields are omitted when nothing is pending
      */
-    200: NamedDefView;
+    200: MutatedDefView;
 };
 
 export type PutApiV1AdminToolsByNameResponse = PutApiV1AdminToolsByNameResponses[keyof PutApiV1AdminToolsByNameResponses];
@@ -7535,7 +7648,7 @@ export type PatchApiV1AdminToolsByNameSettingsResponses = {
     /**
      * The updated mcp-server definition (same `reload_to_apply` restart signal as the PUT; same-module export settings refresh live, while any outstanding boot-bound export instance or projection remains reported)
      */
-    200: NamedDefView;
+    200: MutatedDefView;
 };
 
 export type PatchApiV1AdminToolsByNameSettingsResponse = PatchApiV1AdminToolsByNameSettingsResponses[keyof PatchApiV1AdminToolsByNameSettingsResponses];

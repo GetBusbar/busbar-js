@@ -357,8 +357,8 @@ export const getApiV1AdminAuth = <ThrowOnError extends boolean = false>(options?
 /**
  * Flush the credential cache: one module's partition (`{module}`) or everything (empty body). Instant revocation of the cached-allow window
  */
-export const postApiV1AdminAuthCacheFlush = <ThrowOnError extends boolean = false>(options: Options<PostApiV1AdminAuthCacheFlushData, ThrowOnError>) => {
-    return (options.client ?? _heyApiClient).post<PostApiV1AdminAuthCacheFlushResponse, PostApiV1AdminAuthCacheFlushError, ThrowOnError>({
+export const postApiV1AdminAuthCacheFlush = <ThrowOnError extends boolean = false>(options?: Options<PostApiV1AdminAuthCacheFlushData, ThrowOnError>) => {
+    return (options?.client ?? _heyApiClient).post<PostApiV1AdminAuthCacheFlushResponse, PostApiV1AdminAuthCacheFlushError, ThrowOnError>({
         security: [
             {
                 name: 'x-admin-token',

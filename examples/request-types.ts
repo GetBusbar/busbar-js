@@ -11,10 +11,12 @@ import {
   patchApiV1AdminKeysById,
 } from "../src";
 
-// Compile-only contract regressions: these ten operations formerly forbade bodies.
+// Compile-only contract regressions for request bodies accepted by the server.
 export async function requestTypes(): Promise<void> {
   await putApiV1AdminAdminAuth({ body: { admin_auth: ["admin-tokens"] } });
   await postApiV1AdminAuthCacheFlush({ body: { module: "example" } });
+  // An absent body flushes every credential-cache partition.
+  await postApiV1AdminAuthCacheFlush({});
   await postApiV1AdminConfigApply({ body: { config: {} }, headers: { "If-Match": '"v1"' } });
   await postApiV1AdminConfigRollback({ body: { version: 1 } });
   await postApiV1AdminConfigValidate({ body: { config: {}, providers: {} } });
