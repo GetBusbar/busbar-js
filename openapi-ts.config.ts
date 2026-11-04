@@ -8,5 +8,9 @@ export default defineConfig({
     format: false,
     lint: false,
   },
-  plugins: ['@hey-api/client-fetch'],
+  plugins: [
+    '@hey-api/client-fetch',
+    // Preserve existing SDK export names when the schema adds operation IDs.
+    { name: '@hey-api/sdk', operationId: false },
+  ],
 });
