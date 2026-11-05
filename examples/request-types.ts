@@ -18,10 +18,10 @@ export async function requestTypes(): Promise<void> {
   // An absent body flushes every credential-cache partition.
   await postApiV1AdminAuthCacheFlush({});
   await postApiV1AdminConfigApply({ body: { config: {} }, headers: { "If-Match": '"v1"' } });
-  await postApiV1AdminConfigRollback({ body: { version: 1 } });
+  await postApiV1AdminConfigRollback({ body: { version: "1" } });
   await postApiV1AdminConfigValidate({ body: { config: {}, providers: {} } });
-  await postApiV1AdminHooks({ body: { name: "example", config: {} } });
-  await putApiV1AdminHooksByName({ path: { name: "example" }, body: { config: {} } });
+  await postApiV1AdminHooks({ body: { name: "example", config: { kind: "tap", module: "example" } } });
+  await putApiV1AdminHooksByName({ path: { name: "example" }, body: { config: { kind: "tap", module: "example" } } });
   await patchApiV1AdminHooksByNameSettings({ path: { name: "example" }, body: { settings: {} } });
   await postApiV1AdminKeys({ body: { name: "example", allowed_pools: null } });
   await patchApiV1AdminKeysById({ path: { id: "example" }, body: { enabled: false, group: null } });

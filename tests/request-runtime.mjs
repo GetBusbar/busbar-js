@@ -2,6 +2,74 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 export function registerRequestTests(sdk, { createClient, createConfig }) {
+  test("default usage requests preserve Count decimals before JSON parsing, including custom clients", async () => {
+    const { getApiV1AdminUsage } = sdk;
+    for (const quantity of ["0.1", "27.5", "9007199254740993", "9223372036854.775807", "170141183460469231731687303715884.105727"]) {
+      const client = createClient(createConfig({
+        baseUrl: "https://admin.example",
+        fetch: async () => new Response(`{"total":{"tokens_input":${quantity},"tokens_output":0,"tokens_cache_read":0,"tokens_cache_creation":0,"requests":1,"spend_micros":27},"by_model":[{"model":"model","provider":"provider","tokens_input":${quantity},"tokens_output":0,"tokens_cache_read":0,"tokens_cache_creation":0,"requests":1,"spend_micros":27,"classes":{"duration":{"count":${quantity},"cost":27}}}],"by_key":[],"rate_card_version":"0000000000000000000000000000000000000001"}`, { headers: { "content-type": "application/json" } }),
+      }));
+      const result = await getApiV1AdminUsage({ client, parseAs: "json", throwOnError: true });
+      assert.equal(result.data.total.tokens_input, quantity);
+      assert.equal(result.data.total.tokens_output, "0");
+      assert.equal(result.data.by_model[0].tokens_input, quantity);
+      assert.equal(result.data.by_model[0].classes.duration.count, quantity);
+      assert.equal(result.data.total.requests, "1");
+      assert.equal(result.data.total.spend_micros, "27");
+      assert.equal(result.data.rate_card_version, "0000000000000000000000000000000000000001");
+    }
+  });
+
+  test("Count responses preserve configured validation and per-call transformation hooks", async () => {
+    const seen = [];
+    const client = createClient(createConfig({
+      baseUrl: "https://admin.example",
+      fetch: async () => new Response('{"total":{"tokens_input":9007199254740993}}', { headers: { "content-type": "application/json" } }),
+      responseValidator: async data => { seen.push(["validate", data.total.tokens_input]); },
+      responseTransformer: async () => { throw new Error("per-call transformer must override client config"); },
+    }));
+    const result = await sdk.getApiV1AdminUsage({ client, responseTransformer: async data => {
+      seen.push(["transform", data.total.tokens_input]);
+      return { ...data, transformed: true };
+    } });
+    assert.deepEqual(seen, [["validate", "9007199254740993"], ["transform", "9007199254740993"]]);
+    assert.equal(result.data.transformed, true);
+    client.setConfig({ responseValidator: async () => { throw new Error("validation refused"); } });
+    await assert.rejects(sdk.getApiV1AdminUsage({ client }), /validation refused/);
+  });
+
+  test("usage Count errors reject inexact values and retain HTTP error envelopes", async () => {
+    const { getApiV1AdminUsage } = sdk;
+    const client = createClient(createConfig({
+      baseUrl: "https://admin.example",
+      fetch: async () => new Response('{"total":{"tokens_input":0.0000001}}', { headers: { "content-type": "application/json" } }),
+    }));
+    await assert.rejects(getApiV1AdminUsage({ client }), /six decimal places/);
+    for (const status of [400, 401, 403, 503]) {
+      const error = { error: { code: status === 503 ? "unavailable" : "invalid_request", message: "refused" } };
+      client.setConfig({ fetch: async () => Response.json(error, { status }) });
+      const result = await getApiV1AdminUsage({ client });
+      assert.equal(result.response.status, status);
+      assert.deepEqual(result.error, error);
+    }
+  });
+
+  test("key and group usage preserve Count and integer tokens while ratios remain numeric", async () => {
+    const client = createClient(createConfig({
+      baseUrl: "https://admin.example",
+      fetch: async request => new Response(request.url.includes("/groups/")
+        ? '{"name":"group","as_of":1,"buckets":[{"window":"total","tokens":9007199254740993.125,"requests":1,"spend_cents":2,"tokens_cap":42}]}'
+        : '{"id":"key","budget_period":"total","window_start":0,"as_of":1,"group":null,"tokens":27.5,"requests":1,"spend_cents":2,"rate_headroom":0.25}',
+      { headers: { "content-type": "application/json" } }),
+    }));
+    const key = await sdk.getApiV1AdminKeysByIdUsage({ client, path: { id: "key" }, throwOnError: true });
+    assert.equal(key.data.tokens, "27.5");
+    assert.equal(key.data.rate_headroom, 0.25);
+    const group = await sdk.getApiV1AdminGroupsByNameUsage({ client, path: { name: "group" }, throwOnError: true });
+    assert.equal(group.data.buckets[0].tokens, "9007199254740993.125");
+    assert.equal(group.data.buckets[0].tokens_cap, "42");
+  });
+
   test("SDK sends the configured credential and parses the response", async () => {
     const { getApiV1AdminInfo } = sdk;
     const expected = { version: "test", topology: { pools: 2 } };
@@ -15,7 +83,7 @@ export function registerRequestTests(sdk, { createClient, createConfig }) {
       },
     }));
     const { data } = await getApiV1AdminInfo({ client, throwOnError: true });
-    assert.deepEqual(data, expected);
+    assert.deepEqual(data, { ...expected, topology: { pools: "2" } });
   });
 
   test("mint and hook updates serialize JSON bodies with path and concurrency headers", async () => {

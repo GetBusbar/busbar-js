@@ -50,15 +50,58 @@ console.log("config version:", info.config_version);
 > Prefer `Authorization: Bearer`? Set `headers: { Authorization: "Bearer YOUR_ADMIN_TOKEN" }`
 > instead — the admin API accepts either.
 
+## Exact numeric values
+
+The API sends Count quantities as JSON numbers with at most six decimal places.
+The SDK exposes these annotated fields as `Count` decimal **strings**, including
+whole counts: `"27.5"`, `"0.000001"`, or `"9007199254740993"`. This preserves the
+wire quantity beyond JavaScript's safe integer range. Generated methods decode
+Count-bearing responses from raw text before ordinary JSON number parsing, even
+when given a caller-created fetch client. Configured response validators and
+transformers receive the decoded exact values. The declared
+`lossless-number-token-v1` profile also exposes annotated u64/i64 integers as
+decimal strings, including counters, timestamps and integer money fields. Floating
+ratios keep their numeric types. `integerFromDecimal(text, format)` checks integer
+spelling and the declared u64/i64 bounds. Requests serialize these strings back
+to numeric JSON tokens; existing server wire representations are unchanged.
+Already-rounded JavaScript numbers are rejected.
+
+Do not convert a Count to `number` for billing. Use exact decimal or scaled integer
+arithmetic in the application. The exported `countFromDecimal(text)` validates
+scale 6 and the signed 128-bit mantissa range without rounding. Invalid quantities
+fail decoding rather than being rounded. Count values are strings **inside the
+SDK**, not a change to the server's JSON wire format.
+
+For arbitrary configuration JSON, use `parseExactJson(text)` and
+`stringifyExactJson(value)`. These preserve original numeric tokens (including
+`1.0` and `1e0`) for the server's `integer-token-v1` validation instead of
+normalizing invalid integer spellings into accepted integers. Opaque response
+JSON preserves lossless number objects; these helpers serialize them correctly.
+Custom JSON body serializers must preserve numeric wire types for exact fields.
+
 ## Regenerating the client
 
 The committed client under [`src/`](./src) is generated from `openapi.json`, the
-Busbar 1.6.0 snapshot from core commit
-`16e797c65909c3b8ee3c54d6622d976070ba5e45`. Operation names continue to derive
+Busbar 1.6.0 native schema (SHA-256
+`4444e98668b7c3951854c9892e2b6c9e4fde263a35102aa6af76421a8c7106d1`). Operation names continue to derive
 from HTTP methods and paths, preserving the SDK exports when schema operation IDs
 change. The generation adapter preserves per-request `Headers`, tuple-list, and
 object inputs when merging generated JSON content-type defaults. Its source lives
-in `scripts/generate.mjs` and `runtime/headers.ts`; do not edit generated files.
+in `scripts/generate.mjs` and `runtime/headers.ts`; Count metadata in the canonical
+schema drives `scripts/counts.mjs` and `runtime/counts.ts`. The exact-number
+profile drives `scripts/exact.mjs` and `runtime/exact.ts`. Do not edit generated files.
+The pinned `@hey-api/openapi-ts` 0.64.15 bundler resolves local references inside
+extensions against the OpenAPI root. The `x-busbar-config-schemas` extension is
+instead a standalone JSON Schema with its own `$defs`. `scripts/schema-input.mjs`
+omits only that extension from an isolated generator input after checking that no
+retained OpenAPI reference depends on it. The canonical `openapi.json` shipped in
+the package retains the complete extension byte-for-byte; all operations,
+components and exact-number metadata remain represented in the generator input;
+only declared exact quantities receive browser string types and extensible error
+enums remain open. Extract the
+extension's `schema` object before using its local references for configuration
+forms.
+
 To re-derive it:
 
 ```bash

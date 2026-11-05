@@ -24,7 +24,8 @@
     "test:package": "node --test tests/package-smoke.mjs"
   },
   "dependencies": {
-    "@hey-api/client-fetch": "0.8.4"
+    "@hey-api/client-fetch": "0.8.4",
+    "lossless-json": "4.3.3"
   },
   "devDependencies": {
     "@hey-api/openapi-ts": "0.64.15",

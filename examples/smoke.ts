@@ -1,7 +1,7 @@
 // Compile-only example proving the /info response is TYPED as InfoView.
 import { createClient, createConfig } from "@hey-api/client-fetch";
 import { getApiV1AdminInfo } from "../src";
-import type { InfoView } from "../src";
+import type { InfoView, ExactInteger } from "../src";
 
 const client = createClient(
   createConfig({
@@ -15,6 +15,6 @@ export async function main(): Promise<void> {
   if (error !== undefined) throw error;
   const info: InfoView = data;              // TYPED — no cast or response guard
   const version: string = info.version;     // .version is string
-  const pools: number = info.topology.pools; // nested typed struct
+  const pools: ExactInteger = info.topology.pools; // nested typed struct
   console.log(version, pools, info.config_version);
 }

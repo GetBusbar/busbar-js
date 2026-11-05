@@ -1,5 +1,19 @@
 import { getApiV1AdminInfo, getApiV1AdminPools } from "../src";
-import type { InfoView, PoolListView } from "../src";
+import type { InfoView, PoolListView, ExactInteger } from "../src";
+import { getApiV1AdminPlugins, getApiV1AdminPluginsByFileSchema } from "../src";
+import type { PluginConfiguration, PluginConfigurationSection } from "../src";
+
+export async function linkedDiscoveryResponseTypes(): Promise<void> {
+  const inventory = await getApiV1AdminPlugins({ query: { type: "plane" }, throwOnError: true });
+  const ownership: PluginConfiguration | null | undefined = inventory.data.items[0]?.configuration;
+  const schema = await getApiV1AdminPluginsByFileSchema({
+    path: { file: "llm" }, query: { source: "linked_statement" }, throwOnError: true,
+  });
+  const schemaOwnership: PluginConfiguration | null | undefined = schema.data.configuration;
+  const sections: PluginConfigurationSection[] | undefined = schemaOwnership?.sections;
+  const complete: boolean | undefined = schemaOwnership?.input_schema_complete;
+  void [ownership, schemaOwnership, sections, complete];
+}
 
 // Compile-time regressions for the generator/runtime response contract.
 export async function responseTypes(): Promise<void> {
@@ -34,7 +48,7 @@ import type { CreatedKeyView, HookDesiredStatus } from "../src";
 export async function currentResponseTypes(): Promise<void> {
   const created = await postApiV1AdminKeys({ body: { name: "example" }, throwOnError: true });
   const token: string = created.data.token;
-  const expiry: number = created.data.expires_at;
+  const expiry: ExactInteger = created.data.expires_at;
   const pools: string[] | null = created.data.allowed_pools;
   const rotated = await postApiV1AdminKeysByIdRotate({ path: { id: "example" }, throwOnError: true });
   const rotatedToken: string | null | undefined = rotated.data.token;
@@ -71,4 +85,16 @@ export async function namedMutationResponseTypes(): Promise<void> {
   const patchedPending: string[] | undefined = patched.data.reload_to_apply;
   const patchedNote: string | null | undefined = patched.data.note;
   void [replacedPending, replacedNote, patchedPending, patchedNote];
+}
+
+import { putApiV1AdminConfigSettings } from "../src";
+
+// Both declared mutation response arms carry the same exact u64 generation.
+export async function configurationMutationVersionType(): Promise<void> {
+  const result = await putApiV1AdminConfigSettings({
+    body: { document_patch: { set: { "/limits/request_body_max_bytes": 5000123 } } },
+    throwOnError: true,
+  });
+  const version: ExactInteger = result.data.config_version;
+  void version;
 }

@@ -13,3 +13,9 @@ test("published entry supports CommonJS and ESM consumers", async () => {
 
 const { registerRequestTests } = await import("./request-runtime.mjs");
 registerRequestTests(require("../"), await import("@hey-api/client-fetch"));
+await import("./count-runtime.mjs");
+const { registerAdditiveTests } = await import("./additive-runtime.mjs");
+registerAdditiveTests(require("../"), await import("@hey-api/client-fetch"));
+await import("./generator-input.mjs");
+const { registerExactTests } = await import("./exact-runtime.mjs");
+registerExactTests(require("../"), await import("@hey-api/client-fetch"));
