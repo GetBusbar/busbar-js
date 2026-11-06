@@ -37,7 +37,7 @@ export function integerFromDecimal(text: string, format: ExactPlan["format"] = "
   if (typeof text !== "string") throw new TypeError("Exact integer requires decimal text");
   if (!["uint64", "int64", "uint"].includes(format)) throw new TypeError("Unknown exact integer format");
   if (!/^-?(0|[1-9]\d*)$/.test(text)) throw new TypeError("Exact integer requires an integer token, not a decimal or exponent");
-  if (format !== "uint" && text.replace(/^-/, "").length > 20) throw new RangeError("Integer exceeds declared64-bit range");
+  if (format !== "uint" && text.replace(/^-/, "").length > 20) throw new RangeError("Integer exceeds declared 64-bit range");
   const value = format === "uint" ? 0n : BigInt(text);
   if (format !== "int64" && (value < 0n || text.startsWith("-"))) throw new RangeError("Unsigned integer cannot be negative");
   if (format === "uint64" && value > (1n << 64n) - 1n) throw new RangeError("Integer exceeds u64");
@@ -73,6 +73,9 @@ function walk(value: unknown, plan: ExactPlan | undefined, mode: "response" | "b
   if (isLosslessNumber(value)) return mode === "response" ? Number(value.value) : mode === "url" ? value.value : value;
   if (typeof value === "bigint" && mode === "url") return value.toString();
   if (typeof value === "number" && (mode === "body" || mode === "url") && (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value)))) throw new TypeError("Use parseExactJson for numeric tokens outside the safe binary64 integer range");
+  // Request values serialize as JSON would: Date and other toJSON objects are not records.
+  if (mode !== "response" && value !== null && typeof value === "object" && typeof (value as { toJSON?: unknown }).toJSON === "function")
+    return walk((value as { toJSON: () => unknown }).toJSON(), plan, mode);
   if (Array.isArray(value)) return value.map(item => walk(item, plan?.items, mode));
   if (value !== null && typeof value === "object") {
     const result: Record<string, unknown> = {};
@@ -135,7 +138,8 @@ export function prepareExactRequest(config: Record<string, any>, operation: Exac
         const text = await read();
         let parsed: unknown;
         try { parsed = parse(text); } catch { return text; }
-        return JSON.stringify(walk(parsed, plan, "response"), (_key, value) => isLosslessNumber(value) ? value.value : value);
+        // Lossless stringify keeps opaque numbers numeric; exact fields are already strings.
+        return stringifyExactJson(walk(parsed, plan, "response"));
       } });
     }
     return response;

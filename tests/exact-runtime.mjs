@@ -54,10 +54,10 @@ export function registerExactTests(sdk, { createClient, createConfig }) {
   test("exact-number requests reject rounded numbers invalid integer spelling and range before fetch", async () => {
     let calls = 0;
     const client = createClient(createConfig({ baseUrl: "https://admin.example", fetch: async () => { calls++; return Response.json({}); } }));
-    for (const expires_at of [9007199254740992, "1.0", "1e0", "18446744073709551616", "-1"])
-      await assert.rejects(sdk.postApiV1AdminKeys({ client, body: { name: "key", expires_at } }));
+    for (const [expires_at, reason] of [[9007199254740992, /before binary64/], ["1.0", /integer token/], ["1e0", /integer token/], ["18446744073709551616", /exceeds u64/], ["-1", /cannot be negative/]])
+      await assert.rejects(sdk.postApiV1AdminKeys({ client, body: { name: "key", expires_at } }), reason);
     client.setConfig({ bodySerializer: value => JSON.stringify(value) });
-    await assert.rejects(sdk.postApiV1AdminKeys({ client, body: { name: "key", expires_at: 9007199254740992 } }));
+    await assert.rejects(sdk.postApiV1AdminKeys({ client, body: { name: "key", expires_at: 9007199254740992 } }), /before binary64/);
     assert.throws(() => sdk.integerFromDecimal(9007199254740992), /decimal text/);
     assert.throws(() => sdk.countFromDecimal(9007199254740992), /decimal text/);
     assert.equal(calls, 0);
@@ -67,8 +67,8 @@ export function registerExactTests(sdk, { createClient, createConfig }) {
 
   test("exact-number response decoding refuses invalid tokens and an already-rounded client", async () => {
     const plan = { fields: { value: { kind: "integer", format: "uint64" } } };
-    for (const value of ["1.0", "1e0", "-0", "-1", "18446744073709551616", '"9007199254740993"'])
-      assert.throws(() => parseExactResponse(`{"value":${value}}`, plan));
+    for (const [value, reason] of [["1.0", /integer token/], ["1e0", /integer token/], ["-0", /cannot be negative/], ["-1", /cannot be negative/], ["18446744073709551616", /exceeds u64/], ['"9007199254740993"', /original numeric token/]])
+      assert.throws(() => parseExactResponse(`{"value":${value}}`, plan), reason);
     assert.equal(parseExactResponse('{"value":18446744073709551615}', plan).value, "18446744073709551615");
     const client = { getConfig: () => ({}), get: async () => ({ data: { config_version: 9007199254740992 }, response: Response.json({}) }) };
     await assert.rejects(sdk.getApiV1AdminInfo({ client }), /text decoder|rounded JSON/);
@@ -126,4 +126,55 @@ export function registerExactTests(sdk, { createClient, createConfig }) {
     assert.equal(result.response.status, 400);
     assert.equal(result.error.error.code, "invalid_request");
   });
+
+  test("exact-number error bodies keep opaque numbers numeric and never round invalid exact fields", async () => {
+    const operation = { responses: { 409: { fields: { retry: { kind: "integer", format: "uint64" } }, values: { raw: true } } } };
+    const client = createClient(createConfig({ baseUrl: "https://admin.example", fetch: async () => new Response('{"retry":18446744073709551615,"details":{"attempts":5,"ratio":0.5}}', { status: 409, headers: { "content-type": "application/json" } }) }));
+    const result = await client.get({ url: "/error", ...prepareExactRequest(client.getConfig(), operation) });
+    assert.equal(result.response.status, 409);
+    assert.deepEqual(result.error, { retry: "18446744073709551615", details: { attempts: 5, ratio: 0.5 } });
+    client.setConfig({ fetch: async () => new Response('{"retry":18446744073709551616}', { status: 409 }) });
+    await assert.rejects(client.get({ url: "/error", ...prepareExactRequest(client.getConfig(), operation) }), /exceeds u64/);
+  });
+
+  test("exact-number request bodies serialize toJSON values like JSON instead of dropping them", async () => {
+    const sent = [];
+    const client = createClient(createConfig({ baseUrl: "https://admin.example", fetch: async request => { sent.push(await request.text()); return Response.json({}); } }));
+    const when = new Date(Date.UTC(2026, 0, 2, 3, 4, 5));
+    await sdk.patchApiV1AdminExportByNameSettings({ client, path: { name: "metrics" }, body: { settings: { when, nested: { toJSON: () => ({ big: 9007199254740993n }) } } } });
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0], `{"settings":{"when":"${when.toISOString()}","nested":{"big":9007199254740993}}}`);
+  });
+
+  test("exact-number custom body serializers are validated on the wire they produce", async () => {
+    let calls = 0;
+    const client = createClient(createConfig({ baseUrl: "https://admin.example", fetch: async () => { calls++; return Response.json({}); } }));
+    client.setConfig({ bodySerializer: value => JSON.stringify(value).replace('"expires_at":"1"', '"expires_at":1.0') });
+    await assert.rejects(sdk.postApiV1AdminKeys({ client, body: { name: "key", expires_at: "1" } }), /integer token/);
+    client.setConfig({ bodySerializer: () => ({ name: "key" }) });
+    await assert.rejects(sdk.postApiV1AdminKeys({ client, body: { name: "key" } }), /text body serializer/);
+    assert.equal(calls, 0);
+    client.setConfig({ bodySerializer: value => JSON.stringify(value).replace('"expires_at":"1"', '"expires_at":1') });
+    await sdk.postApiV1AdminKeys({ client, body: { name: "key", expires_at: "1" }, throwOnError: true });
+    assert.equal(calls, 1);
+  });
+
+  test("exact-number responses keep prototype-named keys as own data", () => {
+    const decoded = parseExactResponse('{"value":1,"__proto__":{"polluted":true},"constructor":2}', { fields: { value: { kind: "integer", format: "uint64" } }, values: {} });
+    assert.equal(Object.getPrototypeOf(decoded), Object.prototype);
+    assert.equal(Object.hasOwn(decoded, "__proto__"), true);
+    assert.equal(decoded.__proto__.polluted, true);
+    assert.equal(decoded.constructor, 2);
+    assert.equal({}.polluted, undefined);
+  });
+
+  test("exact-number union plans take the first matching variant and report the last failure", () => {
+    const plan = { fields: { value: { alternatives: [{ kind: "integer", format: "uint64" }, { kind: "count", allowString: true }] } } };
+    assert.equal(parseExactResponse('{"value":18446744073709551615}', plan).value, "18446744073709551615");
+    assert.equal(parseExactResponse('{"value":-0.5}', plan).value, "-0.5");
+    assert.equal(parseExactResponse('{"value":"0.000001"}', plan).value, "0.000001");
+    assert.throws(() => parseExactResponse('{"value":0.0000001}', plan), /more than six decimal places/);
+    assert.throws(() => parseExactResponse('{"value":true}', plan), /original numeric token/);
+  });
 }
+

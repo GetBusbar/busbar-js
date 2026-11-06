@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { clientGeneratorInput } from "../scripts/schema-input.mjs";
-import { countOperations } from "../scripts/counts.mjs";
+import { exactPlan } from "../scripts/exact.mjs";
 
 const canonicalPath = new URL("../openapi.json", import.meta.url);
 
@@ -27,7 +27,6 @@ test("generator input adapts declared exact browser types while preserving canon
   assert(Array.isArray(canonical.components.schemas.Error.properties.error.properties.code.enum));
   const methods = new Set(["get", "post", "put", "patch", "delete", "head", "options", "trace"]);
   assert.equal(Object.values(derived.paths).flatMap(item => Object.keys(item)).filter(key => methods.has(key)).length, 103);
-  assert.equal(countOperations(canonical).size, 3);
   function countMarkers(value) {
     if (!value || typeof value !== "object") return 0;
     return (value["x-busbar-count-scale"] === 6 ? 1 : 0) + Object.values(value).reduce((sum, child) => sum + countMarkers(child), 0);
@@ -48,4 +47,18 @@ test("generator input refuses operation or component references into omitted con
     fromComponent.components.schemas.Unsupported = { $ref: ref };
     assert.throws(() => clientGeneratorInput(fromComponent), /referenced by a retained schema/);
   }
+});
+
+test("exact plans resolve percent-encoded JSON Pointer references", () => {
+  const specification = { components: { schemas: { "Foo Bar": { type: "object", properties: { n: { type: "integer", format: "uint64" } } }, "a/b~c": { type: "integer", format: "int64" } } } };
+  assert.deepEqual(exactPlan({ $ref: "#/components/schemas/Foo%20Bar" }, specification).fields.n, { kind: "integer", format: "uint64" });
+  assert.deepEqual(exactPlan({ $ref: "#/components/schemas/a~1b~0c" }, specification), { kind: "integer", format: "int64" });
+  assert.throws(() => exactPlan({ $ref: "#/components/schemas/Missing" }, specification), /unresolved exact schema/);
+});
+
+test("exact plans keep exact fields reached through applicators on property-less objects", () => {
+  const specification = { components: { schemas: { WithU64: { type: "object", properties: { n: { type: "integer", format: "uint64" } } } } } };
+  const plan = exactPlan({ type: "object", allOf: [{ $ref: "#/components/schemas/WithU64" }] }, specification);
+  assert.deepEqual(plan.fields?.n, { kind: "integer", format: "uint64" });
+  assert.deepEqual(exactPlan({ type: "object" }, specification), { raw: true });
 });

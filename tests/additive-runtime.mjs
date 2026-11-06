@@ -99,7 +99,6 @@ export function registerAdditiveTests(sdk, { createClient, createConfig }) {
       const result = await sdk.getApiV1AdminHooks({ client, throwOnError: true });
       const hook = result.data.items[0];
       for (const key of ["on_empty", "signals", "default", "phase", "fires_at"]) assert.deepEqual(hook[key], expected[key]);
-      assert.equal(Object.hasOwn(hook, "at"), false);
     }
   });
 

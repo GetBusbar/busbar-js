@@ -87,9 +87,9 @@ Busbar 1.6.0 native schema (SHA-256
 from HTTP methods and paths, preserving the SDK exports when schema operation IDs
 change. The generation adapter preserves per-request `Headers`, tuple-list, and
 object inputs when merging generated JSON content-type defaults. Its source lives
-in `scripts/generate.mjs` and `runtime/headers.ts`; Count metadata in the canonical
-schema drives `scripts/counts.mjs` and `runtime/counts.ts`. The exact-number
-profile drives `scripts/exact.mjs` and `runtime/exact.ts`. Do not edit generated files.
+in `scripts/generate.mjs` and `runtime/headers.ts`. The canonical schema's
+exact-number profile (`x-busbar-exact-numbers`, required) drives `scripts/exact.mjs`,
+`runtime/exact.ts` and the Count validator in `runtime/counts.ts`. Do not edit generated files.
 The pinned `@hey-api/openapi-ts` 0.64.15 bundler resolves local references inside
 extensions against the OpenAPI root. The `x-busbar-config-schemas` extension is
 instead a standalone JSON Schema with its own `$defs`. `scripts/schema-input.mjs`
@@ -115,8 +115,8 @@ npm run test:package # checks Node imports and a mocked HTTP request
 The generator and TypeScript versions are pinned in `package.json`
 (`@hey-api/openapi-ts@0.64.15`, `@hey-api/client-fetch@0.8.4`, `typescript@5.7.3` — TS 7 previews crash the
 generator). Keep the generator and fetch runtime compatible: newer runtime response
-generics can silently change inferred response types. CI regenerates on every PR/push and fails if the committed client
-drifts (`git diff --exit-code`).
+generics can silently change inferred response types. After regenerating, the committed
+client must not drift: `git diff --exit-code` must be clean.
 
 The published package contains compiled JavaScript and TypeScript declarations.
 `npm pack` and `npm publish` build and smoke-test it automatically through `prepack`.

@@ -179,10 +179,12 @@ export function registerRequestTests(sdk, { createClient, createConfig }) {
 
   test("object header deletion and multi-value semantics survive normalization", async () => {
     const { postApiV1AdminKeys } = sdk;
+    let calls = 0;
     const client = createClient(createConfig({
       baseUrl: "https://admin.example",
       headers: { "x-remove": "configured" },
       fetch: async (request) => {
+        calls++;
         assert.equal(request.headers.get("x-remove"), null);
         assert.equal(request.headers.get("x-trace"), "first, second");
         assert.equal(request.headers.get("content-type"), "application/json");
@@ -193,6 +195,8 @@ export function registerRequestTests(sdk, { createClient, createConfig }) {
       client,
       body: { name: "example" },
       headers: { "x-remove": null, "x-trace": ["first", "second"] },
+      throwOnError: true,
     });
+    assert.equal(calls, 1);
   });
 }

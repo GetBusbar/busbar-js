@@ -43,12 +43,12 @@ export function exactPlan(schema, specification, active = new Set()) {
   if (schema.$ref) {
     assert(schema.$ref.startsWith("#/"), "only local exact schema references are supported");
     assert(!active.has(schema.$ref), "recursive exact schemas need explicit support");
-    const target = schema.$ref.slice(2).split("/").reduce((value, key) => value?.[key.replace(/~1/g, "/").replace(/~0/g, "~")], specification);
+    const target = decodeURIComponent(schema.$ref.slice(2)).split("/").reduce((value, key) => value?.[key.replace(/~1/g, "/").replace(/~0/g, "~")], specification);
     assert(target, `unresolved exact schema ${schema.$ref}`);
     return exactPlan(target, specification, new Set([...active, schema.$ref]));
   }
   const descriptive = Object.keys(schema).every(key => ["description", "title", "default"].includes(key));
-  const freeObject = schema.type === "object" && !schema.properties && (schema.additionalProperties === undefined || schema.additionalProperties === true || typeof schema.additionalProperties === "object" && Object.keys(schema.additionalProperties).length === 0);
+  const freeObject = schema.type === "object" && !schema.properties && !schema.allOf && !schema.anyOf && !schema.oneOf && (schema.additionalProperties === undefined || schema.additionalProperties === true || typeof schema.additionalProperties === "object" && Object.keys(schema.additionalProperties).length === 0);
   if (descriptive || freeObject) return { raw: true };
   let plan = {};
   const fields = Object.fromEntries(Object.entries(schema.properties ?? {}).flatMap(([name, node]) => {
