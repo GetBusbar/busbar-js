@@ -87,6 +87,19 @@ export function registerExactTests(sdk, { createClient, createConfig }) {
     assert.deepEqual(seen, ["18446744073709551615"]);
   });
 
+  test("exact-number adjustment 503 preserves known not-applied effects and recovery headers", async () => {
+    const receipt = { operation: "adjust", operation_id: "action-1", actor: "operator", target: "key-1", fingerprint: "request-hash", reason_hash: "reason-hash", effect: "not_applied", applied: false, recovery: "receipt", retry: "same_action_only", count_scale: 6 };
+    const client = createClient(createConfig({ baseUrl: "https://admin.example", fetch: async () => Response.json(receipt, { status: 503, headers: { "x-busbar-adjust-effect": "not_applied", "x-busbar-receipt-durable": "false" } }) }));
+    const result = await sdk.postApiV1AdminAdjust({ client, headers: { "Idempotency-Key": "action-1" }, body: { key: "key-1", lane: "model", entry: "a".repeat(40), card_epoch_ms: "0", reason: "correction", delta: { tokens_input: "-0.000001" } } });
+    assert.equal(result.response.status, 503);
+    assert.equal(result.error.effect, "not_applied");
+    assert.equal(result.error.applied, false);
+    assert.equal(result.error.recovery, "receipt");
+    assert.equal(result.error.retry, "same_action_only");
+    assert.equal(result.response.headers.get("x-busbar-adjust-effect"), "not_applied");
+    assert.equal(result.response.headers.get("x-busbar-receipt-durable"), "false");
+  });
+
   test("exact-number empty successes and transport errors preserve HTTP behavior", async () => {
     const client = createClient(createConfig({ baseUrl: "https://admin.example", fetch: async () => new Response(null, { status: 204, headers: { "x-context": "kept" } }) }));
     const removed = await sdk.deleteApiV1AdminKeysById({ client, fetch: undefined, path: { id: "key" }, throwOnError: true });

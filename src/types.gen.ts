@@ -261,17 +261,6 @@ export type HookView = {
      */
     priority: number;
     /**
-     * The LEGACY single-valued tap stage (`"request"`/`"candidate"`/`"routing"`/`"response"`), or
-     * `null`. Kept for back-compat and NOT the field to read: `null` here does NOT mean "a gate"
-     * and does not mean "unscoped". Every hook written in the current top-level `hooks:` grammar
-     * has `at: null` by construction (`config::hook_cfg_from_def` never sets it, and
-     * `--migrate-config` rewrites a legacy `at:` into `phase:`), so this field is `null` for
-     * essentially every hook a running deployment has. Read `fires_at`.
-     * 1.6.0 owner rule: a 1.5.5 client reading this view must see this field byte-for-byte, so it
-     * is RESTORED alongside `phase`/`fires_at`.
-     */
-    at: string | null;
-    /**
      * Gate fallback on timeout/error, a CLOSED, unambiguous string union: one of the
      * reserved terminals (`"weighted"` | `"reject"` | `"first"` | `"nothing"`) or the NAME of the
      * fallback hook the chain continues through. Unambiguous by construction: the terminal words
@@ -279,6 +268,15 @@ export type HookView = {
      * the terminal set is always a terminal and anything else is always a hook reference.
      */
     on_error: string;
+    /**
+     * Configured empty-intersection fallback: `"weighted"` | `"reject"` | `"first"`.
+     * `null` preserves an omitted override, whose runtime default is fail-closed.
+     */
+    on_empty: string | null;
+    /**
+     * Requested signal catalog names, in configured order.
+     */
+    signals: Array<string>;
     /**
      * Gate decision deadline in milliseconds.
      */
@@ -301,19 +299,15 @@ export type HookView = {
      */
     global: boolean;
     /**
-     * The `phase:` STAGE LIST exactly as configured, empty when unset. The literal config echo,
-     * for an operator diffing what they wrote against what busbar parsed. It is NOT the effective
-     * answer on its own: empty means "fall back", and what it falls back TO is `at:` if set and the
-     * four core stages otherwise. For the effective answer read `fires_at`.
+     * Whether this hook replaces the default ordering hook for pools with no named base.
+     */
+    default: boolean;
+    /**
+     * The canonical configured stage list. Empty selects the fixed core stages.
      */
     phase: Array<string>;
     /**
-     * The RESOLVED stage set: the stages this hook ACTUALLY fires at, in pipeline order, never
-     * empty. This is the field that answers "when does this hook run", and it is computed by
-     * `config::HookCfg::resolved_stages` through the same `fires_at_stage` predicate the firing
-     * path uses, so it cannot disagree with runtime behavior. It reflects the frozen precedence
-     * (a non-empty `phase:` wins, else the legacy single `at:`, else the four core stages) without
-     * asking the reader to re-derive it from the two spellings above.
+     * The effective stage set in pipeline order, computed by the runtime firing predicate.
      */
     fires_at: Array<string>;
     /**
@@ -1223,9 +1217,8 @@ export type UsageBreakdown = {
      */
     spend_micros: string;
     /**
-     * THE PLANE-DECLARED CLASSES the row's ledger lines counted outside the token split, keyed by
-     * the class name the plane declares (new in 1.6.0, [`ClassUsage`]). Absent when the row carries
-     * none, so a token-only row reads exactly as 1.5.5's.
+     * Every ledgered class outside the reserved token split, keyed by class name ([`ClassUsage`]).
+     * Includes open classes from every provider and plane. Absent when the row carries none.
      */
     classes?: {
         [key: string]: ClassUsage;
@@ -1275,9 +1268,8 @@ export type ModelUsageView = {
      */
     spend_micros: string;
     /**
-     * THE PLANE-DECLARED CLASSES the row's ledger lines counted outside the token split, keyed by
-     * the class name the plane declares (new in 1.6.0, [`ClassUsage`]). Absent when the row carries
-     * none, so a token-only row reads exactly as 1.5.5's.
+     * Every ledgered class outside the reserved token split, keyed by class name ([`ClassUsage`]).
+     * Includes open classes from every provider and plane. Absent when the row carries none.
      */
     classes?: {
         [key: string]: ClassUsage;
@@ -1312,9 +1304,8 @@ export type KeyUsageView = {
      */
     spend_micros: string;
     /**
-     * THE PLANE-DECLARED CLASSES the row's ledger lines counted outside the token split, keyed by
-     * the class name the plane declares (new in 1.6.0, [`ClassUsage`]). Absent when the row carries
-     * none, so a token-only row reads exactly as 1.5.5's.
+     * Every ledgered class outside the reserved token split, keyed by class name ([`ClassUsage`]).
+     * Includes open classes from every provider and plane. Absent when the row carries none.
      */
     classes?: {
         [key: string]: ClassUsage;
@@ -2699,12 +2690,12 @@ export type PageNamedDefView = {
 };
 
 /**
- * ONE definition of ONE 1.5.3 named-DEFINITION map: the read shape of the GENERIC named-map CRUD
+ * One definition in a named-definition map: the read shape of the generic named-map CRUD
  * (`GET /api/v1/admin/identity-providers[/{name}]`, `GET /api/v1/admin/export[/{name}]`, and
- * `tools:`/`agents:` when they land).
+ * plane-owned named definitions).
  *
- * Deliberately ONE view for every section rather than one per kind: the sections share the frozen
- * `{module, settings}` spine and differ only by optional kind-specific fields, which are
+ * One view serves every section: plugin instances name their backing module, while plane-owned
+ * definitions can describe remote endpoints without a module. Kind-specific fields are
  * `skip_serializing_if`-omitted for a section that has none. So `/export` serves exactly
  * `{name, module, settings_keys}` while `/identity-providers` additionally carries its ceiling,
  * and a new section adds fields here (additive) instead of a parallel view + a parallel handler.
@@ -2724,18 +2715,11 @@ export type NamedDefView = {
      */
     name: string;
     /**
-     * The `module:` backing this instance (a built-in name or a signed-plugin name/alias).
-     *
-     * ALWAYS present, matching 1.5.5's wire shape byte-for-byte (`required` includes `module`,
-     * schema type `"string"`, never nullable): 1.5.5 had no named-map section whose entries
-     * carried no module, so it has no representation for one, and the ruling is 1:1 with 1.5.5
-     * rather than inventing a new shape. EMPTY-STRINGED, not omitted, for a section whose entries
-     * are not plugin instances -- today `agents:`, whose entries describe endpoints somebody else
-     * runs (`NamedMapSection::requires_module`). Every section that HAS a module requires it to be
-     * non-empty, so an empty string is unambiguous for "no module" without a `skip_serializing_if`
-     * that would shrink `required` below 1.5.5's.
+     * The `module:` backing this plugin instance (a built-in name or signed-plugin name/alias).
+     * Omitted for definitions that do not instantiate a module, such as remote agents, and for
+     * an unparseable stored definition that has no string-valued module to project.
      */
-    module: string;
+    module?: string;
     /**
      * The KEY NAMES of the module's opaque settings bag, sorted, WITHOUT their values, the
      * redacted projection of `settings:`. Operator/API-owned and never interpreted here, but also
@@ -2809,18 +2793,11 @@ export type MutatedDefView = {
      */
     name: string;
     /**
-     * The `module:` backing this instance (a built-in name or a signed-plugin name/alias).
-     *
-     * ALWAYS present, matching 1.5.5's wire shape byte-for-byte (`required` includes `module`,
-     * schema type `"string"`, never nullable): 1.5.5 had no named-map section whose entries
-     * carried no module, so it has no representation for one, and the ruling is 1:1 with 1.5.5
-     * rather than inventing a new shape. EMPTY-STRINGED, not omitted, for a section whose entries
-     * are not plugin instances -- today `agents:`, whose entries describe endpoints somebody else
-     * runs (`NamedMapSection::requires_module`). Every section that HAS a module requires it to be
-     * non-empty, so an empty string is unambiguous for "no module" without a `skip_serializing_if`
-     * that would shrink `required` below 1.5.5's.
+     * The `module:` backing this plugin instance (a built-in name or signed-plugin name/alias).
+     * Omitted for definitions that do not instantiate a module, such as remote agents, and for
+     * an unparseable stored definition that has no string-valued module to project.
      */
-    module: string;
+    module?: string;
     /**
      * The KEY NAMES of the module's opaque settings bag, sorted, WITHOUT their values, the
      * redacted projection of `settings:`. Operator/API-owned and never interpreted here, but also
@@ -3365,20 +3342,18 @@ export type ConfigInputGroup = {
     child_default?: ConfigInputChildDefault | null;
 };
 
-export type ConfigInputHook = unknown & {
+/**
+ * Admin hook POST/PUT input. module and phase are the canonical names; use phase:[stage] for a single stage. This differs from the deploy HookDefinition wrapper. Settings may contain hidden values and must never be reconstructed from HookView.
+ */
+export type ConfigInputHook = {
     kind: 'tap' | 'gate';
-    module?: string;
-    /**
-     * @deprecated
-     */
-    plugin?: string;
+    module: string;
     timeout_ms?: string;
     on_error?: string;
     prompt?: 'no' | 'ro' | 'rw';
     user?: 'no' | 'ro';
     priority?: number;
     on_empty?: ('reject' | 'weighted' | 'first') | null;
-    at?: ('request' | 'candidate' | 'routing' | 'response') | null;
     settings?: {
         [key: string]: unknown;
     };
@@ -3390,7 +3365,7 @@ export type ConfigInputHook = unknown & {
 };
 
 /**
- * Actual top-level hooks named-definition input (HookDefCfg). Admin POST/PUT consumes Hook instead. default, signals, global and legacy at are runtime HookCfg fields, not accepted by this deploy wrapper.
+ * Actual top-level hooks named-definition input (HookDefCfg). Admin POST/PUT consumes Hook instead. default, signals and global are accepted by admin writes, not by this deploy wrapper.
  */
 export type ConfigInputHookDefinition = {
     module: string;
@@ -7541,7 +7516,6 @@ export type PutApiV1AdminConfigSettingsData = {
          * Forget only these exact prior document edits before merging the new edit; typed overlays are never removed.
          */
         reset_document_paths?: Array<string>;
-        persist?: true;
     };
     headers?: {
         /**
@@ -8842,9 +8816,9 @@ export type PostApiV1AdminAdjustErrors = {
      */
     429: _Error;
     /**
-     * `unavailable`: the node could not take the unit, or the store could not take the correction. The body is the admin error envelope with code `unavailable`
+     * Typed refusal or durable action outcome. An action outcome body carries effect and reconciliation identity; unknown effect requires recovery, never a new automatic delta.
      */
-    503: _Error;
+    503: _Error | AdjustmentActionView | AdjustmentActionInFlightError;
     /**
      * Other typed administrative refusal. Branch on known codes while preserving unknown strings; retry depends on operation semantics.
      */

@@ -66,7 +66,7 @@ export function registerAdditiveTests(sdk, { createClient, createConfig }) {
   test("config union modes preserve document, catalog and legacy request bodies and responses", async () => {
     const cases = [
       { body: { limits: { request_body_max_bytes: 5000123 } }, response: { applied: true, config_version: 8, settings: { limits: { request_body_max_bytes: 5000123 } }, reload_to_apply: [] } },
-      { body: { document_patch: { set: { "/limits/request_body_max_bytes": 5000123, "/rate_card/llm/input": 0.125, "/tls": null }, remove: ["/providers/retired"] }, providers_patch: { set: { "/example/base_url": "https://api.example.com" } }, reset_document_paths: ["/limits"], reset_providers_paths: ["/example"], persist: true }, response: { applied: true, persisted: true, config_version: 9, configuration: { config_version: 9, state: "restart_pending", source: "installed_generation", config_locked: false, values: { limits: { request_body_max_bytes: 5000123 } }, reload_to_apply: ["listen"] }, reload_to_apply: ["listen"] } },
+      { body: { document_patch: { set: { "/limits/request_body_max_bytes": 5000123, "/rate_card/llm/input": 0.125, "/tls": null }, remove: ["/providers/retired"] }, providers_patch: { set: { "/example/base_url": "https://api.example.com" } }, reset_document_paths: ["/limits"], reset_providers_paths: ["/example"] }, response: { applied: true, persisted: true, config_version: 9, configuration: { config_version: 9, state: "restart_pending", source: "installed_generation", config_locked: false, values: { limits: { request_body_max_bytes: 5000123 } }, reload_to_apply: ["listen"] }, reload_to_apply: ["listen"] } },
     ];
     for (const { body, response } of cases) {
       const client = createClient(createConfig({ baseUrl: "https://admin.example", fetch: async request => {
@@ -85,6 +85,21 @@ export function registerAdditiveTests(sdk, { createClient, createConfig }) {
       } else {
         assert.equal(result.data.settings.limits.request_body_max_bytes.value, "5000123");
       }
+    }
+  });
+
+  test("canonical hook readback preserves replacement inputs", async () => {
+    for (const on_empty of [null, "first"]) {
+      const expected = { name: "ranking", kind: "gate", transport: { kind: "none", target: null }, prompt: "no", user: "no", priority: 0, on_error: "reject", on_empty, signals: ["requested_model", "latency"], default: true, timeout_ms: 1000, settings_keys: [], global: false, phase: ["routing"], fires_at: ["routing"], groups: [] };
+      const client = createClient(createConfig({ baseUrl: "https://admin.example", fetch: async request => {
+        assert.equal(request.method, "GET");
+        assert.equal(new URL(request.url).pathname, "/api/v1/admin/hooks");
+        return Response.json({ items: [expected], next_cursor: null });
+      } }));
+      const result = await sdk.getApiV1AdminHooks({ client, throwOnError: true });
+      const hook = result.data.items[0];
+      for (const key of ["on_empty", "signals", "default", "phase", "fires_at"]) assert.deepEqual(hook[key], expected[key]);
+      assert.equal(Object.hasOwn(hook, "at"), false);
     }
   });
 
