@@ -52,7 +52,7 @@ export function integerFromDecimal(text: string, format: ExactPlan["format"] = "
 
 function walk(value: unknown, plan: ExactPlan | undefined, mode: "response" | "body" | "url" | "wire"): unknown {
   if (value === undefined && mode !== "response" && mode !== "wire") return undefined;
-  if (plan?.raw && mode === "response") return value;
+  if (plan?.raw && mode === "response" && !plan.fields && !plan.items && !plan.values && !plan.alternatives) return value;
   if (value === null && plan?.nullable) return null;
   if (plan?.alternatives) {
     let failure: unknown;
