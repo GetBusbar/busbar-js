@@ -2188,6 +2188,9 @@ export type Identity = {
     ];
 };
 
+/**
+ * LlmProducerDrive: producer drive returned; buffered response bytes may still be draining. MountedResponseReady: mounted handler returned its response; its body may still be streaming.
+ */
 export type Phase = 'LlmProducerDrive' | 'MountedResponseReady';
 
 export type Dropped = {
@@ -3385,8 +3388,8 @@ export type ConfigInputHookDefinition = {
     }) | null;
 };
 
-export type PatchSettingsReq = unknown & {
-    settings?: {
+export type SettingsReplacement = {
+    settings: {
         [key: string]: unknown;
     };
     edit?: {
@@ -3395,15 +3398,24 @@ export type PatchSettingsReq = unknown & {
         };
         remove?: Array<string>;
     };
-    [key: string]: unknown | {
+};
+
+export type SettingsModification = {
+    settings?: {
         [key: string]: unknown;
-    } | {
+    };
+    edit: {
         set?: {
             [key: string]: unknown;
         };
         remove?: Array<string>;
-    } | undefined;
+    };
 };
+
+/**
+ * Select exactly one mode. settings replaces the entire bag, dropping omitted keys. edit applies explicit top-level set/remove and preserves every unmentioned key, including hidden secrets. Null setting values are values; remove is explicit. Both modes use the existing runtime configure acknowledgement before config commit and the same conflict/outcome semantics. Never submit redacted readback as replacement settings.
+ */
+export type PatchSettingsReq = SettingsReplacement | SettingsModification;
 
 /**
  * The key mutation is known committed; a later cache/readback step failed. This is not a rejected/no-effect mutation. Reconcile the named resource. Rotation's new secret is not recoverable from this response; never repeat the old action to rotate again.
@@ -4720,11 +4732,24 @@ export type PutApiV1AdminIdentityProvidersByNameResponses = {
 export type PutApiV1AdminIdentityProvidersByNameResponse = PutApiV1AdminIdentityProvidersByNameResponses[keyof PutApiV1AdminIdentityProvidersByNameResponses];
 
 export type PatchApiV1AdminIdentityProvidersByNameSettingsData = {
-    body: unknown & {
-        settings?: {
+    /**
+     * settings replaces the entire bag, dropping omitted keys; edit explicitly sets/removes top-level keys and preserves all others. Null setting values are values. A setting cannot appear in both set and remove. Never reconstruct a replacement from redacted readback.
+     */
+    body: {
+        settings: {
             [key: string]: unknown;
         };
         edit?: {
+            set?: {
+                [key: string]: unknown;
+            };
+            remove?: Array<string>;
+        };
+    } | {
+        settings?: {
+            [key: string]: unknown;
+        };
+        edit: {
             set?: {
                 [key: string]: unknown;
             };
@@ -5042,11 +5067,24 @@ export type PutApiV1AdminExportByNameResponses = {
 export type PutApiV1AdminExportByNameResponse = PutApiV1AdminExportByNameResponses[keyof PutApiV1AdminExportByNameResponses];
 
 export type PatchApiV1AdminExportByNameSettingsData = {
-    body: unknown & {
-        settings?: {
+    /**
+     * settings replaces the entire bag, dropping omitted keys; edit explicitly sets/removes top-level keys and preserves all others. Null setting values are values. A setting cannot appear in both set and remove. Never reconstruct a replacement from redacted readback.
+     */
+    body: {
+        settings: {
             [key: string]: unknown;
         };
         edit?: {
+            set?: {
+                [key: string]: unknown;
+            };
+            remove?: Array<string>;
+        };
+    } | {
+        settings?: {
+            [key: string]: unknown;
+        };
+        edit: {
             set?: {
                 [key: string]: unknown;
             };
@@ -5360,11 +5398,24 @@ export type PutApiV1AdminToolsByNameResponses = {
 export type PutApiV1AdminToolsByNameResponse = PutApiV1AdminToolsByNameResponses[keyof PutApiV1AdminToolsByNameResponses];
 
 export type PatchApiV1AdminToolsByNameSettingsData = {
-    body: unknown & {
-        settings?: {
+    /**
+     * settings replaces the entire bag, dropping omitted keys; edit explicitly sets/removes top-level keys and preserves all others. Null setting values are values. A setting cannot appear in both set and remove. Never reconstruct a replacement from redacted readback.
+     */
+    body: {
+        settings: {
             [key: string]: unknown;
         };
         edit?: {
+            set?: {
+                [key: string]: unknown;
+            };
+            remove?: Array<string>;
+        };
+    } | {
+        settings?: {
+            [key: string]: unknown;
+        };
+        edit: {
             set?: {
                 [key: string]: unknown;
             };
@@ -5678,11 +5729,24 @@ export type PutApiV1AdminAgentsByNameResponses = {
 export type PutApiV1AdminAgentsByNameResponse = PutApiV1AdminAgentsByNameResponses[keyof PutApiV1AdminAgentsByNameResponses];
 
 export type PatchApiV1AdminAgentsByNameSettingsData = {
-    body: unknown & {
-        settings?: {
+    /**
+     * settings replaces the entire bag, dropping omitted keys; edit explicitly sets/removes top-level keys and preserves all others. Null setting values are values. A setting cannot appear in both set and remove. Never reconstruct a replacement from redacted readback.
+     */
+    body: {
+        settings: {
             [key: string]: unknown;
         };
         edit?: {
+            set?: {
+                [key: string]: unknown;
+            };
+            remove?: Array<string>;
+        };
+    } | {
+        settings?: {
+            [key: string]: unknown;
+        };
+        edit: {
             set?: {
                 [key: string]: unknown;
             };
@@ -7050,8 +7114,11 @@ export type GetApiV1AdminConfigVersionsByVResponses = {
 export type GetApiV1AdminConfigVersionsByVResponse = GetApiV1AdminConfigVersionsByVResponses[keyof GetApiV1AdminConfigVersionsByVResponses];
 
 export type PatchApiV1AdminHooksByNameSettingsData = {
-    body: unknown & {
-        settings?: {
+    /**
+     * settings replaces the entire bag, dropping omitted keys; edit explicitly sets/removes top-level keys and preserves all others. Null setting values are values. A setting cannot appear in both set and remove. Never reconstruct a replacement from redacted readback.
+     */
+    body: {
+        settings: {
             [key: string]: unknown;
         };
         edit?: {
@@ -7060,14 +7127,16 @@ export type PatchApiV1AdminHooksByNameSettingsData = {
             };
             remove?: Array<string>;
         };
-        [key: string]: unknown | {
+    } | {
+        settings?: {
             [key: string]: unknown;
-        } | {
+        };
+        edit: {
             set?: {
                 [key: string]: unknown;
             };
             remove?: Array<string>;
-        } | undefined;
+        };
     };
     headers?: {
         /**
@@ -7487,9 +7556,65 @@ export type GetApiV1AdminConfigSettingsResponses = {
 export type GetApiV1AdminConfigSettingsResponse = GetApiV1AdminConfigSettingsResponses[keyof GetApiV1AdminConfigSettingsResponses];
 
 export type PutApiV1AdminConfigSettingsData = {
-    body: ({
-        [key: string]: unknown;
-    } & unknown) | {
+    body: {
+        listen?: string | null;
+        /**
+         * Inbound TLS: cert and key SecretRefs, plus optional client_ca.
+         */
+        tls?: {
+            [key: string]: unknown;
+        } | Array<unknown> | null;
+        admin_listen?: string | null;
+        /**
+         * Admin listener TLS: cert and key SecretRefs, plus optional client_ca.
+         */
+        admin_tls?: {
+            [key: string]: unknown;
+        } | Array<unknown> | null;
+        admin_require_mtls?: boolean | null;
+        rate_card?: {
+            [key: string]: {
+                [key: string]: unknown;
+            } | Array<unknown>;
+        } | null;
+        per_request_fee?: string | null;
+        /**
+         * Store selection: module and module-owned settings; requires restart.
+         */
+        store?: {
+            [key: string]: unknown;
+        } | Array<unknown> | null;
+        /**
+         * Per-field SecurityPatch; omitted or null members preserve their value.
+         */
+        security?: {
+            [key: string]: unknown;
+        } | Array<unknown> | null;
+        /**
+         * Per-field LimitsPatch; omitted members preserve their value. Null datagram_line_memory_bytes explicitly disables that limit.
+         */
+        limits?: {
+            [key: string]: unknown;
+        } | Array<unknown> | null;
+        /**
+         * Per-field AdvancedPatch; omitted or null members preserve their value.
+         */
+        advanced?: {
+            [key: string]: unknown;
+        } | Array<unknown> | null;
+        /**
+         * Per-field HealthPatch; omitted or null members preserve their value.
+         */
+        health?: {
+            [key: string]: unknown;
+        } | Array<unknown> | null;
+        /**
+         * Per-field RoutingPatch; omitted or null members preserve their value.
+         */
+        routing?: {
+            [key: string]: unknown;
+        } | Array<unknown> | null;
+    } | {
         /**
          * Lowest-priority Store overlay over config.yaml, parsed with boot's schema. RFC6901 paths; strict sequence indices replace existing entries, terminal - appends. Within one request, indices name the input snapshot; sets precede descending removals. Each subsequent request addresses the current authored document. Null is a value, removal is explicit. Omitted values including secrets survive. Overlapping paths and edits shadowed by existing typed overlays are refused. Restart-only fields are reported. Patch history is bounded to 4096 total operations and 1 MiB; pointer depth is at most 128. Limit violations reject the transaction.
          */
