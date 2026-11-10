@@ -52,7 +52,7 @@ export type BuildInfo = {
      */
     auth_modules: Array<string>;
     /**
-     * Hook plugins baked into this binary (e.g. `["ranking"]`).
+     * Hook plugins baked into this binary (e.g. `["ranking", "complexity"]`).
      */
     hook_plugins: Array<string>;
     /**
