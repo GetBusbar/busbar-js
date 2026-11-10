@@ -1,6 +1,9 @@
 /** Exact decimal text in the SDK; the Admin API sends Count as a JSON number. */
 export type Count = string;
 
+const _MIN_I128 = -(1n << 127n);
+const _MAX_I128 = (1n << 127n) - 1n;
+
 /** Validate scale 6 and the signed i128 mantissa without converting through a float. */
 export function countFromDecimal(text: string): Count {
   if (typeof text !== "string") throw new TypeError("Count requires decimal text before numeric conversion");
@@ -25,7 +28,7 @@ export function countFromDecimal(text: string): Count {
   }
   if (scaled.length > 39) throw new RangeError("Count is outside the exact scale-6 range");
   const mantissa = BigInt((match[1] || "") + scaled);
-  if (mantissa < -(1n << 127n) || mantissa > (1n << 127n) - 1n)
+  if (mantissa < _MIN_I128 || mantissa > _MAX_I128)
     throw new RangeError("Count is outside the exact scale-6 range");
   return text;
 }

@@ -2,6 +2,11 @@ import { isLosslessNumber, LosslessNumber, parse, stringify } from "lossless-jso
 import { jsonBodySerializer } from "@hey-api/client-fetch";
 import { countFromDecimal } from "./runtime-counts.gen";
 
+const _U64_MAX = (1n << 64n) - 1n;
+const _I64_MIN = -(1n << 63n);
+const _I64_MAX = (1n << 63n) - 1n;
+const _standardBodySerializerSource = Function.prototype.toString.call(jsonBodySerializer.bodySerializer);
+
 export type ExactInteger = string;
 export interface ExactPlan {
   kind?: "integer" | "count";
@@ -40,8 +45,8 @@ export function integerFromDecimal(text: string, format: ExactPlan["format"] = "
   if (format !== "uint" && text.replace(/^-/, "").length > 20) throw new RangeError("Integer exceeds declared 64-bit range");
   const value = format === "uint" ? 0n : BigInt(text);
   if (format !== "int64" && (value < 0n || text.startsWith("-"))) throw new RangeError("Unsigned integer cannot be negative");
-  if (format === "uint64" && value > (1n << 64n) - 1n) throw new RangeError("Integer exceeds u64");
-  if (format === "int64" && (value < -(1n << 63n) || value > (1n << 63n) - 1n)) throw new RangeError("Integer exceeds i64");
+  if (format === "uint64" && value > _U64_MAX) throw new RangeError("Integer exceeds u64");
+  if (format === "int64" && (value < _I64_MIN || value > _I64_MAX)) throw new RangeError("Integer exceeds i64");
   return text;
 }
 
@@ -54,7 +59,7 @@ function walk(value: unknown, plan: ExactPlan | undefined, mode: "response" | "b
     for (const variant of plan.alternatives) {
       try { return walk(value, variant, mode); } catch (error) { failure = error; }
     }
-    throw failure;
+    throw failure ?? new TypeError("No matching alternative in exact plan");
   }
   if (plan?.kind) {
     const token = isLosslessNumber(value);
@@ -117,7 +122,7 @@ export function prepareExactRequest(config: Record<string, any>, operation: Exac
     const encoded = walk(value, body, "body");
     const serializer = config.bodySerializer;
     // CJS and ESM copies of the pinned client have distinct function identities.
-    const standard = serializer === jsonBodySerializer.bodySerializer || typeof serializer === "function" && Function.prototype.toString.call(serializer) === Function.prototype.toString.call(jsonBodySerializer.bodySerializer);
+    const standard = serializer === jsonBodySerializer.bodySerializer || typeof serializer === "function" && Function.prototype.toString.call(serializer) === _standardBodySerializerSource;
     if (serializer && !standard && serializer !== stringifyExactJson) {
       const text = serializer(value);
       if (typeof text !== "string") throw new TypeError("Exact JSON requires a text body serializer");
@@ -134,7 +139,7 @@ export function prepareExactRequest(config: Record<string, any>, operation: Exac
     const plan = operation.responses[String(response.status)] ?? operation.responses.default;
     if (!response.ok && plan) {
       const read = response.text.bind(response);
-      Object.defineProperty(response, "text", { value: async () => {
+      Object.defineProperty(response, "text", { configurable: true, value: async () => {
         const text = await read();
         let parsed: unknown;
         try { parsed = parse(text); } catch { return text; }
