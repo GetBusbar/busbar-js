@@ -7,6 +7,31 @@ const require = createRequire(import.meta.url);
 const { parseExactResponse, prepareExactRequest } = require("../dist/runtime-exact.gen.js");
 
 export function registerExactTests(sdk, { createClient, createConfig }) {
+  test("usage observations preserve exact strings and remain optional", async () => {
+    const observation = {
+      key_id: "key-1", group: "team", instance: "gateway", destination: "provider",
+      serving_subject: "requested-model", rated_subject: "billed-model",
+      accounting_time: "18446744073709551615",
+      counts: { duration: "170141183460469231731687303715884.105727", requests: "0.000001" },
+      spend_micros: "9223372036854775.807",
+    };
+    for (const present of [true, false]) {
+      const payload = {
+        window: { start: 0, end: 1 }, as_of: 1, currency: "USD", rate_card_version: null,
+        total: { tokens_input: 0, tokens_output: 0, tokens_cache_read: 0, tokens_cache_creation: 0, requests: 0, spend_micros: 0 },
+        by_model: [], by_key: [], by_key_truncated: false,
+        ...(present ? { observations: [observation] } : {}),
+      };
+      const client = createClient(createConfig({
+        baseUrl: "https://admin.example",
+        fetch: async () => new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } }),
+      }));
+      const result = await sdk.getApiV1AdminUsage({ client, throwOnError: true });
+      assert.equal(Object.hasOwn(result.data, "observations"), present);
+      if (present) assert.deepEqual(result.data.observations, [observation]);
+    }
+  });
+
   test("exact-number profile drives all annotated integer and decimal response plans", () => {
     const spec = JSON.parse(readFileSync(new URL("../openapi.json", import.meta.url)));
     assert.equal(spec["x-busbar-exact-numbers"].profile, "lossless-number-token-v1");

@@ -1184,6 +1184,12 @@ export type UsageView = {
      * `total == sum(by_key) + others`).
      */
     others?: UsageBreakdown | null;
+    /**
+     * Immutable observation accounting, already included in the totals above. Omitted when
+     * empty. These rows preserve the original serving subject separately from the priced one;
+     * a rate-card snapshot query never reprices their committed charges.
+     */
+    observations?: Array<ObservationUsageView>;
 };
 
 /**
@@ -1310,6 +1316,33 @@ export type KeyUsageView = {
     classes?: {
         [key: string]: ClassUsage;
     };
+};
+
+/**
+ * An authoritative dated observation total. Decimal strings preserve exact numeric values
+ * in clients whose JSON number representation cannot represent every integer or decimal.
+ */
+export type ObservationUsageView = {
+    key_id: string;
+    group: string;
+    instance: string;
+    destination: string;
+    serving_subject: string;
+    rated_subject: string;
+    /**
+     * Original accounting time, as an exact epoch-seconds integer string.
+     */
+    accounting_time: string;
+    /**
+     * Disjoint raw class counts, as canonical decimal strings. No derived parents are inserted.
+     */
+    counts: {
+        [key: string]: string;
+    };
+    /**
+     * Committed spend in micro-units, as an exact decimal string (up to three fractional places).
+     */
+    spend_micros: string;
 };
 
 /**
@@ -3360,7 +3393,7 @@ export type ConfigInputHook = {
     settings?: {
         [key: string]: unknown;
     };
-    signals?: Array<'requested_model' | 'request_total_chars' | 'request_message_count' | 'request_tool_count' | 'request_system_chars' | 'candidate_breaker_state' | 'candidate_error_rate' | 'candidate_latency_p95_ms' | 'routing_policy' | 'response_tokens_out' | 'candidate_route_cost'>;
+    signals?: Array<'requested_model' | 'request_total_chars' | 'request_message_count' | 'request_tool_count' | 'request_system_chars' | 'candidate_breaker_state' | 'candidate_error_rate' | 'candidate_latency_p95_ms' | 'routing_policy' | 'response_tokens_out' | 'candidate_route_cost' | 'request_text_complete'>;
     global?: boolean;
     default?: boolean;
     groups?: Array<string>;

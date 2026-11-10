@@ -98,3 +98,20 @@ export async function configurationMutationVersionType(): Promise<void> {
   const version: ExactInteger = result.data.config_version;
   void version;
 }
+
+import { getApiV1AdminUsage } from "../src";
+import type { ObservationUsageView, UsageView } from "../src";
+
+export async function observationUsageResponseTypes(): Promise<void> {
+  const result = await getApiV1AdminUsage({ throwOnError: true });
+  const observations: ObservationUsageView[] | undefined = result.data.observations;
+  const count: string | undefined = observations?.[0]?.counts.duration;
+  const micros: string | undefined = observations?.[0]?.spend_micros;
+  const epoch: string | undefined = observations?.[0]?.accounting_time;
+  void [observations, count, micros, epoch];
+}
+
+export type ObservationCountsUseStrings = Assert<ObservationUsageView["counts"][string] extends string ? true : false>;
+export type ObservationSpendUsesStrings = Assert<ObservationUsageView["spend_micros"] extends string ? true : false>;
+export type ObservationTimeUsesStrings = Assert<ObservationUsageView["accounting_time"] extends string ? true : false>;
+export type ObservationsRemainOptional = Assert<undefined extends UsageView["observations"] ? true : false>;
