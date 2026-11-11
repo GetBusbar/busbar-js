@@ -83,7 +83,7 @@ Custom JSON body serializers must preserve numeric wire types for exact fields.
 
 The committed client under [`src/`](./src) is generated from `openapi.json`, the
 Busbar 1.6.0 native schema (SHA-256
-`fb2190f752d4f8d9e550cc0e3b269bc3cfd4c88afc63949fb358b0cdce17f7b4`). Operation names continue to derive
+`470bc97ae3f4895dce444af9580ec9f22fd263ad94912232ad0faf5a73b86b40`). Operation names continue to derive
 from HTTP methods and paths, preserving the SDK exports when schema operation IDs
 change. The generation adapter preserves per-request `Headers`, tuple-list, and
 object inputs when merging generated JSON content-type defaults. Its source lives

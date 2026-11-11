@@ -7610,6 +7610,16 @@ export type PutApiV1AdminConfigSettingsData = {
                 [key: string]: unknown;
             } | Array<unknown>;
         } | null;
+        /**
+         * Exact common measurement rates by plugin kind, actual configured namespace, and declared class. Integer or decimal-string micro-units per quantity; missing rates remain unpriced. The whole map is replaced when supplied, including an empty map to clear it.
+         */
+        plugin_rate_cards?: {
+            [key: string]: {
+                [key: string]: {
+                    [key: string]: number | string;
+                };
+            };
+        } | null;
         per_request_fee?: string | null;
         /**
          * Store selection: module and module-owned settings; requires restart.
